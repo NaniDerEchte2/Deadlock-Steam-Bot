@@ -1343,15 +1343,10 @@ class BetaInviteFlow(commands.Cog):
         if BETA_MAIN_GUILD_ID:
             try:
                 guild_obj = discord.Object(id=int(BETA_MAIN_GUILD_ID))
-                synced = await self.bot.tree.sync(guild=guild_obj)
-                log.info(
-                    "BetaInvite: Commands für Guild %s synchronisiert (%s)",
-                    BETA_MAIN_GUILD_ID,
-                    len(synced),
-                )
+                asyncio.create_task(self._sync_guild_commands(guild_obj))
             except Exception as exc:
                 log.warning(
-                    "BetaInvite: Command-Sync für Guild %s fehlgeschlagen: %s",
+                    "BetaInvite: Guild-Command-Sync konnte nicht gestartet werden (%s): %s",
                     BETA_MAIN_GUILD_ID,
                     exc,
                 )
@@ -1384,6 +1379,19 @@ class BetaInviteFlow(commands.Cog):
         self._kofi_server = None
         self._kofi_webhook_task = None
         log.info("BetaInvite: Cog unloaded and server task cleaned up.")
+
+    async def _sync_guild_commands(self, guild_obj: discord.Object) -> None:
+        try:
+            synced = await asyncio.wait_for(self.bot.tree.sync(guild=guild_obj), timeout=20.0)
+            log.info(
+                "BetaInvite: Commands für Guild %s synchronisiert (%s)",
+                guild_obj.id,
+                len(synced),
+            )
+        except asyncio.TimeoutError:
+            log.warning("BetaInvite: Guild-Command-Sync Timeout (>20s) für Guild %s", guild_obj.id)
+        except Exception as exc:
+            log.warning("BetaInvite: Command-Sync für Guild %s fehlgeschlagen: %s", guild_obj.id, exc)
 
     def _main_guild(self) -> discord.Guild | None:
         try:

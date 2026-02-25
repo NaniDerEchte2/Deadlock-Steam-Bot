@@ -192,16 +192,22 @@ class SteamFriendsSync(commands.Cog):
             # Global-Tree → Guild-Tree verschieben, damit der Command sofort sichtbar ist
             self.bot.tree.remove_command("sync_steam_friends")
             self.bot.tree.add_command(self.slash_sync_friends, guild=guild_obj)
-            try:
-                synced = await self.bot.tree.sync(guild=guild_obj)
-                log.info(
-                    "SteamFriendsSync: Guild-Command sync abgeschlossen (%d commands)", len(synced)
-                )
-            except Exception as exc:
-                log.warning("SteamFriendsSync: Guild-Command-Sync fehlgeschlagen: %s", exc)
+            # Sync nicht blockierend ausführen (Discord Rate Limits können ~60s dauern)
+            asyncio.create_task(self._sync_guild_commands(guild_obj))
 
     def cog_unload(self) -> None:
         self.periodic_sync.cancel()
+
+    async def _sync_guild_commands(self, guild_obj: discord.Object) -> None:
+        try:
+            synced = await asyncio.wait_for(self.bot.tree.sync(guild=guild_obj), timeout=20.0)
+            log.info(
+                "SteamFriendsSync: Guild-Command sync abgeschlossen (%d commands)", len(synced)
+            )
+        except asyncio.TimeoutError:
+            log.warning("SteamFriendsSync: Guild-Command-Sync Timeout (>20s) – wird übersprungen")
+        except Exception as exc:
+            log.warning("SteamFriendsSync: Guild-Command-Sync fehlgeschlagen: %s", exc)
 
     @tasks.loop(hours=6)
     async def periodic_sync(self) -> None:
