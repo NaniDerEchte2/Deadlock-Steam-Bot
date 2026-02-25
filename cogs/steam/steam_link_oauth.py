@@ -515,9 +515,8 @@ class SteamLink(commands.Cog):
             await self._cleanup_recent_bot_dms(user, limit=25)
             shine = (
                 "✨ **Connection complete.**\n"
-                "🤝 Unser Steam-Bot schickt dir gleich eine Freundschaftsanfrage. "
-                "Falls in den nächsten Minuten nichts ankommt, kannst du den Bot mit dem Freundescode **820142646** manuell hinzufügen – "
-                "sobald die Freundschaft steht, erkennt er deine Verknüpfung automatisch."
+                "🤝 Bitte sende dem Steam-Bot jetzt eine Freundschaftsanfrage Freundescode: **820142646**." 
+                "Sobald die Freundschaft besteht, wird deine Verknüpfung aktiv und wir erkennen deinen Rang."
             )
             await user.send(shine)
         except Exception as e:
@@ -1008,9 +1007,10 @@ class SteamLink(commands.Cog):
 
     async def _send_account_link_panel(self, ctx: commands.Context) -> None:
         desc = (
-            "Waehle, wie du deinen Account verknüpfen willst:\n"
+            "Wähle, wie du deinen Account verknüpfen willst:\n"
             "- **Steam**: direkter OpenID-Login bei Steam.\n\n"
-            "Nach erfolgreicher Verknüpfung bekommst du automatisch eine Steam-Freundschaftsanfrage vom Bot."
+            "Wichtig: Schicke dem Steam-Bot direkt eine Freundschaftsanfrage "
+            "Freundescode **820142646** – sonst wird die Verknüpfung nicht aktiv."
         )
         embed = discord.Embed(
             title="Account verknüpfen",

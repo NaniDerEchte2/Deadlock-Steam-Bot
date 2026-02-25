@@ -44,7 +44,8 @@ def make_link_embed(
 
     lines += [
         "**So geht's:**",
-        "Wähle eine der beiden Optionen unten. Nach dem Login schickt der Bot dir eine **Freundschaftsanfrage auf Steam** – einfach annehmen, fertig.",
+        "Wähle eine der beiden Optionen unten. Danach **musst du dem Steam-Bot eine Freundschaftsanfrage senden** "
+        "Freundescode **820142646**, sonst wird die Verknüpfung nicht aktiv.",
     ]
 
     return discord.Embed(

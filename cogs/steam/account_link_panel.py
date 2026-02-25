@@ -62,7 +62,8 @@ class SteamLinkPanelView(discord.ui.View):
             "Waehle, wie du deinen Account verknüpfen willst:\n"
             "- **Discord**: liest deine verbundenen Accounts und erkennt Steam automatisch.\n"
             "- **Steam**: direkter OpenID-Login bei Steam.\n\n"
-            "Nach erfolgreicher Verknüpfung bekommst du automatisch eine Steam-Freundschaftsanfrage vom Bot."
+            "Wichtig: Sende dem Steam-Bot direkt eine Freundschaftsanfrage (Freundescode **820142646**), "
+            "sonst kann die Verknüpfung nicht abgeschlossen werden."
         )
         embed = discord.Embed(
             title="Account verknüpfen", description=desc, color=discord.Color.green()
@@ -134,11 +135,14 @@ class SteamLinkPanelView(discord.ui.View):
                 )
                 return
 
+            rank_label = snap.rank_name or "Unbekannt"
+            subrank_label = snap.subrank if snap.subrank is not None else "–"
+            account_label = snap.account_id if getattr(snap, "account_id", None) else "–"
             text = (
                 f"**Rank für {sid}**\n"
-                f"Tier: {snap.rank_name} (#{snap.rank_value})\n"
-                f"Subrank: {snap.subrank or '–'}\n"
-                f"Badge: {snap.badge_level or '–'}"
+                f"Rank: {rank_label}\n"
+                f"Subrank: {subrank_label}\n"
+                f"Account-ID: {account_label}"
             )
             await interaction.followup.send(text, ephemeral=True)
         except Exception:
@@ -189,7 +193,8 @@ class SteamLinkPanel(commands.Cog):
                 "- Dein Rang wird automatisch auf dem Server angezeigt\n"
                 "- Der Live-Status in den Voice Lanes funktioniert\n"
                 "- Du wirst in der Spieler-Suche korrekt eingestuft\n\n"
-                "Klick einfach auf den Button – der Rest geht automatisch."
+                "Klick auf den Button und schick dem Steam-Bot eine Freundschaftsanfrage "
+                "(Freundescode **820142646**), damit die Verknüpfung aktiv wird."
             ),
             color=0x00AEEF,
         )
