@@ -496,14 +496,14 @@ class DeadlockFriendRank(commands.Cog):
 
     @staticmethod
     def _format_rank_line(card: dict[str, Any]) -> str:
-        rank_num, subrank_num, badge, rank_name = DeadlockFriendRank._extract_rank_fields(card)
-        if rank_num is None and badge is None:
+        rank_num, subrank_num, _badge, rank_name = DeadlockFriendRank._extract_rank_fields(card)
+        if rank_num is None:
             return "Kein Ranked-Badge gefunden."
 
-        tier_label = rank_name or (f"Tier {rank_num}" if rank_num is not None else "Unbekannt")
+        tier_label = rank_name or "Unbekannt"
         if subrank_num is not None:
-            return f"{tier_label} · Subrank {subrank_num} (Badge {badge})"
-        return f"{tier_label} (Badge {badge})"
+            return f"{tier_label} · Subrank {subrank_num}"
+        return tier_label
 
     @classmethod
     def _snapshot_from_profile_card(
@@ -1079,11 +1079,14 @@ class DeadlockFriendRank(commands.Cog):
 
         account_id = card.get("account_id") or data.get("account_id")
         steam_id = data.get("steam_id64")
-        rank_line = self._format_rank_line(card)
+
+        _rank_num, subrank_num, _badge, rank_name = self._extract_rank_fields(card)
+        rank_label = rank_name or "Unbekannt"
 
         lines = [
             f"🎯 **Deadlock Rank** für {lookup.label}",
-            f"- Rank: {rank_line}",
+            f"- Rank: {rank_label}",
+            f"- Subrank: {subrank_num}" if subrank_num is not None else "- Subrank: `-`",
             f"- Account-ID: `{account_id}`" if account_id is not None else "- Account-ID: `-`",
         ]
         if steam_id:

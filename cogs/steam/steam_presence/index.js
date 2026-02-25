@@ -497,6 +497,7 @@ const taskModule = require('./src/tasks')({
   buildUpdateHeroBuild, buildMinimalHeroBuild, mapHeroBuildFromRow, sendHeroBuildUpdate,
   safeJsonParse, safeNumber, safeJsonStringify, wrapOk, truncateError,
   buildPlaytestPayloadOverrideFn, playtestMsgConfigs,
+  DEFAULT_GC_READY_TIMEOUT_MS, DEFAULT_GC_READY_ATTEMPTS,
   requestDeadlockGcTokens, waitForDeadlockGcReady, sendDeadlockGcHello, ensureDeadlockGamePlaying,
   sendPlaytestInvite, sendPlaytestInviteOnce, handlePlaytestInviteResponse,
   parseSteamID, isAlreadyFriend, isFriendViaWebApi, getWebApiFriendCacheAgeMs,
