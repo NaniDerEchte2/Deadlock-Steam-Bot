@@ -136,6 +136,5 @@ setInterval(() => {
   return {
     commandInProgress,
     COMMAND_HANDLERS,
-    processCommandLoop,
   };
 };

@@ -252,6 +252,8 @@ const TASK_POLL_INTERVAL_MS = parseInt(process.env.STEAM_TASK_POLL_MS || '2000',
 const RECONNECT_DELAY_MS = parseInt(process.env.STEAM_RECONNECT_DELAY_MS || '5000', 10);
 const COMMAND_BOT_KEY = 'steam';
 const COMMAND_POLL_INTERVAL_MS = parseInt(process.env.STEAM_COMMAND_POLL_MS || '2000', 10);
+const STATE_PUBLISH_INTERVAL_MS = parseInt(process.env.STEAM_STATE_PUBLISH_MS || '15000', 10);
+const GC_UNHEALTHY_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
 const DB_BUSY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.DEADLOCK_DB_BUSY_TIMEOUT_MS || '15000', 10));
 const FRIEND_SYNC_INTERVAL_MS = Math.max(60000, parseInt(process.env.STEAM_FRIEND_SYNC_MS || '300000', 10));
 const FRIEND_REQUEST_BATCH_SIZE = Math.max(1, parseInt(process.env.STEAM_FRIEND_REQUEST_BATCH || '10', 10));
@@ -453,6 +455,7 @@ const {
   getDeadlockGcHelloPayload, createDeadlockGcReadyPromise, waitForDeadlockGcReady,
 } = gcConn;
 sharedCtx.waitForDeadlockGcReady = waitForDeadlockGcReady;
+sharedCtx.clearReconnectTimer = clearReconnectTimer;
 
 // 4. Auth (needs clearReconnectTimer from gcConn; late-binds ctx.scheduleStatePublish)
 const auth = require('./src/auth')(sharedCtx);
@@ -513,12 +516,10 @@ const commandModule = require('./src/commands')({
   syncFriendsAndLinks, collectKnownFriendIds, resolveCachedPersonaName,
   requestProfileCardForSid, queueFriendRequestForId,
   selectPendingCommandStmt, markCommandRunningStmt, finalizeCommandStmt,
-  COMMAND_BOT_KEY, nowSeconds,
+  COMMAND_BOT_KEY, COMMAND_POLL_INTERVAL_MS, STATE_PUBLISH_INTERVAL_MS, GC_UNHEALTHY_THRESHOLD_MS, shutdown, nowSeconds,
   wrapOk, safeJsonParse, safeJsonStringify, truncateError,
   handleLogoutTask,
 });
-const { processCommandLoop } = commandModule;
-
 // ---------- Steam Events ----------
 require('./src/events')({
   ...stateModule,
@@ -534,8 +535,8 @@ require('./src/events')({
   GC_MSG_CLIENT_TO_GC_UPDATE_HERO_BUILD, GC_MSG_CLIENT_TO_GC_UPDATE_HERO_BUILD_RESPONSE,
   GC_CLIENT_HELLO_PROTOCOL_VERSION,
   playtestMsgConfigs, buildPlaytestPayloadOverrideFn,
-  REFRESH_TOKEN_PATH, STEAM_VAULT_REFRESH_TOKEN, STEAM_TOKEN_VAULT_ENABLED,
-  writeToken, writeDeadlockGcTrace, requestDeadlockGcTokens,
+  REFRESH_TOKEN_PATH, MACHINE_TOKEN_PATH, STEAM_VAULT_REFRESH_TOKEN, STEAM_VAULT_MACHINE_TOKEN, STEAM_TOKEN_VAULT_ENABLED,
+  writeToken, writeDeadlockGcTrace, requestDeadlockGcTokens, getDeadlockGcTokenCount,
   GC_MSG_FIND_HERO_BUILDS_RESPONSE,
   unverifySteamLinkStmt,
   nowSeconds,
