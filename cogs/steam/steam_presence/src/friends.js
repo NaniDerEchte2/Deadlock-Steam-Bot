@@ -95,7 +95,13 @@ module.exports = (ctx) => {
   }
 
   // ---------- WebAPI Friend Cache ----------
-  async function loadWebApiFriendIds(force = false) {
+  // Temporarily disabled: rely solely on GC/client data to avoid WebAPI 401 spam.
+  const DISABLE_WEBAPI_FRIENDS = ['1', 'true', 'yes', 'on', 'y'].includes(
+    String(process.env.STEAM_DISABLE_WEBAPI_FRIENDS || '1').toLowerCase()
+  );
+
+  async function loadWebApiFriendIds(force = false) { // eslint-disable-line no-unused-vars
+    if (DISABLE_WEBAPI_FRIENDS) return null;
     if (!STEAM_API_KEY) {
       if (!state.webApiFriendCacheWarned) {
         state.webApiFriendCacheWarned = true;
@@ -142,7 +148,8 @@ module.exports = (ctx) => {
     return state.webApiFriendCachePromise;
   }
 
-  async function isFriendViaWebApi(steamId64) {
+  async function isFriendViaWebApi(steamId64) { // eslint-disable-line no-unused-vars
+    if (DISABLE_WEBAPI_FRIENDS) return { friend: false, source: 'webapi-disabled', refreshed: false };
     const normalized = String(steamId64 || '').trim();
     if (!normalized) return { friend: false, source: 'webapi', refreshed: false };
 
@@ -341,14 +348,16 @@ module.exports = (ctx) => {
       }
     }
 
-    try {
-      const webIds = await loadWebApiFriendIds(false);
-      if (webIds && webIds.size) {
-        webIds.forEach((sid) => { const norm = normalizeSteamId64(sid); if (norm) ids.add(norm); });
-        webCount = webIds.size;
+    if (!DISABLE_WEBAPI_FRIENDS) {
+      try {
+        const webIds = await loadWebApiFriendIds(false);
+        if (webIds && webIds.size) {
+          webIds.forEach((sid) => { const norm = normalizeSteamId64(sid); if (norm) ids.add(norm); });
+          webCount = webIds.size;
+        }
+      } catch (err) {
+        log('debug', 'Friend sync: failed to load WebAPI friend list', { error: err && err.message ? err.message : String(err) });
       }
-    } catch (err) {
-      log('debug', 'Friend sync: failed to load WebAPI friend list', { error: err && err.message ? err.message : String(err) });
     }
 
     return { ids, clientCount, webCount };
