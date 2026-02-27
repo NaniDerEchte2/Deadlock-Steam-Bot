@@ -996,33 +996,11 @@ class BetaInviteLinkPromptView(discord.ui.View):
         self,
         cog: BetaInviteFlow,
         user_id: int,
-        login_url: str | None,
         steam_url: str | None,
     ) -> None:
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
-
-        if login_url:
-            self.add_item(
-                discord.ui.Button(
-                    label="Via Discord bei Steam anmelden",
-                    style=discord.ButtonStyle.link,
-                    url=login_url,
-                    emoji="🔗",
-                    row=0,
-                )
-            )
-        else:
-            self.add_item(
-                discord.ui.Button(
-                    label="Via Discord bei Steam anmelden",
-                    style=discord.ButtonStyle.secondary,
-                    disabled=True,
-                    emoji="🔗",
-                    row=0,
-                )
-            )
 
         if steam_url:
             self.add_item(
@@ -1755,19 +1733,11 @@ class BetaInviteFlow(commands.Cog):
         await self._process_invite_request(interaction)
 
     def _build_link_prompt_view(self, user: discord.abc.User) -> discord.ui.View:
-        login_url: str | None = None
         steam_url: str | None = None
         try:
             steam_cog = self.bot.get_cog("SteamLink")
         except Exception:  # pragma: no cover - defensive
             steam_cog = None
-
-        if steam_cog and hasattr(steam_cog, "discord_start_url_for"):
-            try:
-                candidate = steam_cog.discord_start_url_for(int(user.id))  # type: ignore[attr-defined]
-                login_url = str(candidate) or None
-            except Exception:
-                log.debug("Konnte Discord-Link für BetaInvite nicht bauen", exc_info=True)
 
         if steam_cog and hasattr(steam_cog, "steam_start_url_for"):
             try:
@@ -1776,7 +1746,7 @@ class BetaInviteFlow(commands.Cog):
             except Exception:
                 log.debug("Konnte Steam-Link für BetaInvite nicht bauen", exc_info=True)
 
-        return BetaInviteLinkPromptView(self, user.id, login_url, steam_url)
+        return BetaInviteLinkPromptView(self, user.id, steam_url)
 
     async def _process_invite_request(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "process_invite_request.start")
@@ -2745,7 +2715,8 @@ class BetaInviteFlow(commands.Cog):
                 view = self._build_link_prompt_view(interaction.user)
                 prompt = (
                     "Bevor wir fortfahren können, musst du deinen Steam-Account verknüpfen.\n"
-                    "Nutze einen der unten verfügbaren Login-Optionen. Sobald du fertig bist, klicke auf **Weiter**."
+                    "Nutze den Steam-Login unten. Sobald du fertig bist, klicke auf **Weiter**.\n"
+                    "Open Source: <https://github.com/NaniDerEchte2/Deadlock-Bots>"
                 )
                 await self._edit_original_response(interaction, content=prompt, view=view)
                 _trace("betainvite_no_link", discord_id=interaction.user.id)

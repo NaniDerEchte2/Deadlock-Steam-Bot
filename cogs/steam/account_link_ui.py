@@ -1,7 +1,7 @@
 """
 Wiederverwendbares Steam-Account-Verknüpfen UI.
 
-Stellt Embed + View mit den 2 Link-Buttons bereit.
+Stellt Embed + View mit Steam-Link-Button bereit.
 Kann von überall importiert werden: Onboarding, Rang-Auswahl, etc.
 
 Verwendung:
@@ -43,8 +43,17 @@ def make_link_embed(
         ]
 
     lines += [
+        "**Datenschutz-Kurzinfo:**",
+        "- Discord erhält aus diesem Schritt keine zusätzlichen Daten.",
+        "- Wir speichern nur die technisch nötigen IDs (Discord-ID und SteamID64).",
+        "- Wir erhalten keine Passwörter oder sonstige Zugangsdaten.",
+        "- Es werden keine Daten an Dritte weitergegeben.",
+        "",
+        "**Open Source:**",
+        "Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>",
+        "",
         "**So geht's:**",
-        "Wähle eine der beiden Optionen unten. Danach **musst du dem Steam-Bot eine Freundschaftsanfrage senden** "
+        "Klick auf den Steam-Button unten. Danach **musst du dem Steam-Bot eine Freundschaftsanfrage senden** "
         "Freundescode **820142646**, sonst wird die Verknüpfung nicht aktiv.",
     ]
 
@@ -62,25 +71,15 @@ def make_link_embed(
 
 def make_link_view(user_id: int, *, timeout: float | None = 3600) -> discord.ui.View:
     """
-    Erstellt einen View mit den 2 Link-Buttons für die Steam-Verknüpfung.
+    Erstellt einen View mit Steam-Link-Button für die Steam-Verknüpfung.
 
-    Gibt immer einen View zurück – ohne Buttons wenn URLs nicht generiert
+    Gibt immer einen View zurück – ohne Button wenn URL nicht generiert
     werden können (z. B. PUBLIC_BASE_URL nicht gesetzt).
     """
-    discord_url, steam_url = _get_urls(user_id)
+    steam_url = _get_steam_url(user_id)
 
     view = discord.ui.View(timeout=timeout)
 
-    if discord_url:
-        view.add_item(
-            discord.ui.Button(
-                label="Via Discord bei Steam anmelden",
-                style=discord.ButtonStyle.link,
-                url=discord_url,
-                emoji="🔗",
-                row=0,
-            )
-        )
     if steam_url:
         view.add_item(
             discord.ui.Button(
@@ -92,9 +91,9 @@ def make_link_view(user_id: int, *, timeout: float | None = 3600) -> discord.ui.
             )
         )
 
-    if not discord_url and not steam_url:
+    if not steam_url:
         log.warning(
-            "account_link_ui: Keine OAuth-URLs generiert (PUBLIC_BASE_URL gesetzt?) für user_id=%s",
+            "account_link_ui: Keine Steam-URL generiert (PUBLIC_BASE_URL gesetzt?) für user_id=%s",
             user_id,
         )
 
@@ -139,16 +138,13 @@ async def send_link_panel(
 # ---------------------------------------------------------------------------
 
 
-def _get_urls(user_id: int) -> tuple[str, str]:
-    """Gibt (discord_url, steam_url) zurück. Leere Strings bei Fehler."""
+def _get_steam_url(user_id: int) -> str:
+    """Gibt die Steam-Login-URL zurück. Leerer String bei Fehler."""
     from service.config import settings
 
     base = settings.public_base_url.rstrip("/")
     if not base:
-        return "", ""
+        return ""
 
     uid = int(user_id)
-    return (
-        f"{base}/discord/login?uid={uid}",
-        f"{base}/steam/login?uid={uid}",
-    )
+    return f"{base}/steam/login?uid={uid}"

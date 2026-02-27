@@ -1007,8 +1007,14 @@ class SteamLink(commands.Cog):
 
     async def _send_account_link_panel(self, ctx: commands.Context) -> None:
         desc = (
-            "Wähle, wie du deinen Account verknüpfen willst:\n"
-            "- **Steam**: direkter OpenID-Login bei Steam.\n\n"
+            "Verknüpfe deinen Steam-Account direkt über Steam OpenID.\n\n"
+            "**Datenschutz-Kurzinfo:**\n"
+            "- Discord erhält aus diesem Schritt keine zusätzlichen Daten.\n"
+            "- Wir speichern nur die technisch nötigen IDs (Discord-ID und SteamID64).\n"
+            "- Wir erhalten keine Passwörter oder sonstige Zugangsdaten.\n"
+            "- Es werden keine Daten an Dritte weitergegeben.\n\n"
+            "**Open Source:**\n"
+            "Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>\n\n"
             "Wichtig: Schicke dem Steam-Bot direkt eine Freundschaftsanfrage "
             "Freundescode **820142646** – sonst wird die Verknüpfung nicht aktiv."
         )
@@ -1039,7 +1045,7 @@ class SteamLink(commands.Cog):
     @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @commands.hybrid_command(
         name="account_verknüpfen",
-        description="Zeigt die Verknüpfungsoptionen für Discord und Steam",
+        description="Zeigt den Steam-OpenID-Link zur Account-Verknüpfung",
     )
     async def account_verknuepfen(self, ctx: commands.Context) -> None:
         await self._send_account_link_panel(ctx)
