@@ -1,0 +1,78 @@
+name: "🧪 Continuous Fuzzing"
+
+on:
+  pull_request:
+  push:
+    branches: [ "main", "master", "develop" ]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-fuzzing:
+    name: "Protocol Fuzzing (auto-detect fast-check target)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "20"
+
+      - name: Configure Fuzzing Depth
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "FUZZ_NUM_RUNS=10000" >> $GITHUB_ENV
+          else
+            echo "FUZZ_NUM_RUNS=2000" >> $GITHUB_ENV
+          fi
+
+      - name: Detect fuzz:protocol targets
+        id: detect
+        run: |
+          python3 - << 'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          targets = []
+          for pkg in Path('.').rglob('package.json'):
+            if 'node_modules' in pkg.parts:
+              continue
+            try:
+              data = json.loads(pkg.read_text(encoding='utf-8'))
+            except Exception:
+              continue
+            scripts = data.get('scripts', {})
+            if isinstance(scripts, dict) and 'fuzz:protocol' in scripts:
+              targets.append(str(pkg.parent))
+
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as fh:
+            if targets:
+              fh.write('targets<<EOF\n')
+              fh.write('\n'.join(targets))
+              fh.write('\nEOF\n')
+            else:
+              fh.write('targets=\n')
+          print('Detected fuzz targets:', ', '.join(targets) if targets else '(none)')
+          PY
+
+      - name: Install Fuzzing Dependencies and Run
+        if: steps.detect.outputs.targets != ''
+        run: |
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            echo "Running fuzz target in: $dir"
+            npm ci --prefix "$dir" --include=dev --ignore-scripts
+            npm --prefix "$dir" run fuzz:protocol
+          done <<< "${{ steps.detect.outputs.targets }}"
+
+      - name: Skip note when no fuzz target exists
+        if: steps.detect.outputs.targets == ''
+        run: echo "No package.json with fuzz:protocol script found; skipping fuzz run."

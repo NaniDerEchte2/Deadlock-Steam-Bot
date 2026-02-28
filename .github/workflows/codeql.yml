@@ -1,0 +1,161 @@
+name: "CodeQL Advanced (auto-detect)"
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+  schedule:
+    - cron: '44 10 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect languages
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      found: ${{ steps.detect.outputs.found }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect present languages
+        id: detect
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const root = process.env.GITHUB_WORKSPACE || '.';
+            const exts = new Set();
+
+            function walk(dir) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const p = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  // Skip common bulky dirs
+                  if (['.git','node_modules','.venv','venv','dist','build','__pycache__'].includes(entry.name)) continue;
+                  walk(p);
+                } else {
+                  const m = entry.name.match(/(\.[^.]+)$/);
+                  if (m) exts.add(m[1].toLowerCase());
+                }
+              }
+            }
+            walk(root);
+
+            const has = (arr) => arr.some(e => exts.has(e));
+
+            // Map file extensions -> CodeQL language + sensible build-mode
+            const langs = [];
+
+            if (has(['.py']))              langs.push({ language: 'python',                 build: 'none' });
+            if (has(['.js','.ts','.tsx'])) langs.push({ language: 'javascript-typescript',  build: 'none' });
+            if (has(['.go']))              langs.push({ language: 'go',                     build: 'autobuild' });
+            if (has(['.java','.kt','.kts'])) langs.push({ language: 'java-kotlin',          build: 'autobuild' });
+            if (has(['.cs']))              langs.push({ language: 'csharp',                 build: 'autobuild' });
+            if (has(['.rb']))              langs.push({ language: 'ruby',                   build: 'none' });
+            if (has(['.rs']))              langs.push({ language: 'rust',                   build: 'autobuild' });
+            // Optional/Best-effort:
+            if (has(['.c','.cc','.cpp','.cxx','.h','.hpp'])) langs.push({ language: 'c-cpp', build: 'autobuild' });
+            if (has(['.swift']))           langs.push({ language: 'swift',                  build: 'autobuild' });
+
+            // GitHub Actions (workflows) — nur wenn wirklich QL-Packs dafür erwünscht
+            if (fs.existsSync(path.join(root, '.github', 'workflows'))) {
+              const hasYaml = fs.readdirSync(path.join(root, '.github', 'workflows'))
+                                .some(n => n.endsWith('.yml') || n.endsWith('.yaml'));
+              if (hasYaml) langs.push({ language: 'actions', build: 'none' });
+            }
+
+            const found = langs.length > 0;
+            const matrix = JSON.stringify({ include: langs });
+
+            core.setOutput('found', String(found));
+            core.setOutput('matrix', matrix);
+            core.info(`Detected languages: ${found ? langs.map(l => l.language).join(', ') : '(none)'}`);
+
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: detect
+    if: needs.detect.outputs.found == 'true'
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    permissions:
+      security-events: write
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # Runtimes nur da, wo es hilft – schadet nicht, macht Autobuild stabiler
+      - name: Setup Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Setup Node.js
+        if: matrix.language == 'javascript-typescript' || matrix.language == 'actions'
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+
+      - name: Setup Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: '1.22'
+
+      - name: Setup Java
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup .NET
+        if: matrix.language == 'csharp'
+        uses: actions/setup-dotnet@baa11fbfe1d6520db94683bd5c7a3818018e4309 # v5.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build }}
+          tools: linked
+          config-file: ./.github/codeql/codeql-config.yml
+
+      # Für compiled langs übernimmt CodeQL bei 'autobuild' den Versuch automatisch.
+      # Fehlschläge müssen den Workflow blockieren.
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: true
+
+      - name: Archive SARIF
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: /home/runner/work/**/results/**/*.sarif
+          if-no-files-found: ignore

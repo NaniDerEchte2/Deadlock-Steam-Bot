@@ -1,0 +1,33 @@
+name: "Maximum Security & Quality Analysis"
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+packs:
+  python:
+    - codeql/python-queries
+  javascript-typescript:
+    - codeql/javascript-queries
+  go:
+    - codeql/go-queries
+  java-kotlin:
+    - codeql/java-queries
+  csharp:
+    - codeql/csharp-queries
+  ruby:
+    - codeql/ruby-queries
+  rust:
+    - codeql/rust-queries
+  c-cpp:
+    - codeql/cpp-queries
+  swift:
+    - codeql/swift-queries
+
+paths-ignore:
+  - '**/node_modules/**'
+  - '**/.venv/**'
+  - '**/venv/**'
+  - '**/dist/**'
+  - '**/build/**'
+  - '**/__pycache__/**'

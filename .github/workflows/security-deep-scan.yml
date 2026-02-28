@@ -1,0 +1,514 @@
+name: "🔒 Deep Security Scan (Optimized)"
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-languages:
+    name: 🔍 Detect Project Structure
+    runs-on: ubuntu-latest
+    outputs:
+      has_python: ${{ steps.check.outputs.has_python }}
+      has_javascript: ${{ steps.check.outputs.has_javascript }}
+      has_requirements: ${{ steps.check.outputs.has_requirements }}
+      has_pyproject: ${{ steps.check.outputs.has_pyproject }}
+      has_package_json: ${{ steps.check.outputs.has_package_json }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check project structure
+        id: check
+        run: |
+          if find . -type f -name "*.py" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_python=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_python=false" >> $GITHUB_OUTPUT
+          fi
+
+          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" \) \
+            -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_javascript=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_javascript=false" >> $GITHUB_OUTPUT
+          fi
+
+          if find . -type f -name "requirements*.txt" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_requirements=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_requirements=false" >> $GITHUB_OUTPUT
+          fi
+
+          if find . -type f -name "pyproject.toml" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_pyproject=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_pyproject=false" >> $GITHUB_OUTPUT
+          fi
+
+          if find . -type f -name "package.json" \
+            -not -path "*/node_modules/*" | grep -q .; then
+            echo "has_package_json=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_package_json=false" >> $GITHUB_OUTPUT
+          fi
+
+  python-security:
+    name: 🐍 Python Security Suite
+    needs: detect-languages
+    if: needs.detect-languages.outputs.has_python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Install analysis tools
+        run: python -m pip install --require-hashes -r .github/requirements-tools-locked.txt
+
+      - name: Bandit security scan (strict)
+        run: |
+          bandit -r . -f json -o bandit-report.json -ll
+          bandit -r . -ll
+
+      - name: Pip-Audit requirements scan (strict)
+        if: needs.detect-languages.outputs.has_requirements == 'true'
+        run: |
+          mkdir -p pip-audit-reports
+          found=0
+          audit_fail=0
+
+          while IFS= read -r req_file; do
+            found=1
+            rel_path="${req_file#./}"
+            safe_name="$(echo "$rel_path" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            echo "pip-audit for $req_file"
+            if ! pip-audit -r "$req_file" --format json --output "pip-audit-reports/${safe_name}.json"; then
+              audit_fail=1
+            fi
+          done < <(find . -type f -name "requirements*.txt" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" | sort)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No requirements*.txt files found for pip-audit"
+          fi
+
+          if [ "$audit_fail" -ne 0 ]; then
+            echo "pip-audit found vulnerable dependencies."
+            exit 1
+          fi
+
+      - name: Pip-Audit pyproject scan (strict)
+        if: needs.detect-languages.outputs.has_pyproject == 'true'
+        run: |
+          mkdir -p pip-audit-reports
+          found=0
+          audit_fail=0
+
+          while IFS= read -r pyproject; do
+            found=1
+            dir_path="$(dirname "$pyproject")"
+            rel_dir="${dir_path#./}"
+            safe_name="$(echo "${rel_dir:-root}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            echo "pip-audit for pyproject: $dir_path"
+
+            python -m venv .audit-venv
+            source .audit-venv/bin/activate
+            python -m pip install --upgrade pip
+            if ! pip install "$dir_path"; then
+              echo "Install failed for $dir_path"
+              audit_fail=1
+              deactivate || true
+              rm -rf .audit-venv
+              continue
+            fi
+
+            if ! pip-audit --format json --output "$GITHUB_WORKSPACE/pip-audit-reports/${safe_name}.pyproject.json"; then
+              audit_fail=1
+            fi
+
+            deactivate
+            rm -rf .audit-venv
+          done < <(find . -type f -name "pyproject.toml" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" | sort)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No pyproject.toml files found for pip-audit"
+          fi
+
+          if [ "$audit_fail" -ne 0 ]; then
+            echo "pyproject dependency audit found vulnerabilities or install failures."
+            exit 1
+          fi
+
+      - name: Complexity analysis
+        run: |
+          radon cc . -a -nb --total-average > radon-complexity.txt || true
+          radon mi . -nb > radon-maintainability.txt || true
+
+      - name: Find dead code
+        run: |
+          vulture . --min-confidence 80 > vulture-report.txt || true
+
+      - name: Dodgy suspicious pattern check
+        run: |
+          dodgy > dodgy-report.txt || true
+
+      - name: Upload Python security reports
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: python-security-reports
+          path: |
+            bandit-report.json
+            pip-audit-reports/*.json
+            radon-*.txt
+            vulture-report.txt
+            dodgy-report.txt
+          if-no-files-found: ignore
+
+  javascript-security:
+    name: 📦 JavaScript/TypeScript Security
+    needs: detect-languages
+    if: needs.detect-languages.outputs.has_javascript == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+
+      - name: Detect fuzz targets
+        id: fuzz
+        run: |
+          python3 - << 'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          targets = []
+          for pkg in Path('.').rglob('package.json'):
+            if 'node_modules' in pkg.parts:
+              continue
+            try:
+              data = json.loads(pkg.read_text(encoding='utf-8'))
+            except Exception:
+              continue
+            scripts = data.get('scripts', {})
+            if isinstance(scripts, dict) and 'fuzz:protocol' in scripts:
+              targets.append(str(pkg.parent))
+
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as fh:
+            if targets:
+              fh.write('targets<<EOF\n')
+              fh.write('\n'.join(targets))
+              fh.write('\nEOF\n')
+            else:
+              fh.write('targets=\n')
+          PY
+
+      - name: Property-based fuzzing (strict)
+        if: steps.fuzz.outputs.targets != ''
+        run: |
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            npm ci --prefix "$dir" --include=dev --ignore-scripts
+            npm --prefix "$dir" run fuzz:protocol
+          done <<< "${{ steps.fuzz.outputs.targets }}"
+
+      - name: NPM audit (recursive lockfile scan, strict)
+        if: hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json') != ''
+        run: |
+          mkdir -p npm-audit-reports
+          found=0
+          audit_fail=0
+
+          while IFS= read -r lock_file; do
+            found=1
+            dir_path="$(dirname "$lock_file")"
+            rel_dir="${dir_path#./}"
+            safe_name="$(echo "${rel_dir:-root}" | sed 's#[^A-Za-z0-9._-]#_#g')"
+            echo "NPM audit for $dir_path"
+            if ! (
+              cd "$dir_path"
+              npm audit --audit-level=low --json > "$GITHUB_WORKSPACE/npm-audit-reports/${safe_name}.json"
+            ); then
+              audit_fail=1
+            fi
+          done < <(find . -type f \( -name "package-lock.json" -o -name "npm-shrinkwrap.json" \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" | sort)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No npm lockfiles found for recursive audit"
+          fi
+
+          if [ "$audit_fail" -ne 0 ]; then
+            echo "npm audit found vulnerabilities."
+            exit 1
+          fi
+
+      - name: RetireJS scan (strict)
+        if: hashFiles('**/package.json') != ''
+        run: |
+          npx --yes retire@5.4.2 --path . --outputformat json --outputpath retirejs-report.json
+
+      - name: ESLint security scan (strict)
+        if: hashFiles('**/package.json') != ''
+        run: |
+          ESLINT_DIR=/tmp/eslint-scan
+          mkdir -p "$ESLINT_DIR"
+          cp .github/eslint-security/package.json "$ESLINT_DIR"/
+          cp .github/eslint-security/package-lock.json "$ESLINT_DIR"/
+          npm ci --prefix "$ESLINT_DIR" --ignore-scripts
+
+          cat > "$ESLINT_DIR/eslint.config.mjs" << 'ESLINTEOF'
+          import pluginSecurity from "eslint-plugin-security";
+          import noSecrets from "eslint-plugin-no-secrets";
+
+          export default [
+            pluginSecurity.configs.recommended,
+            {
+              files: ["**/*.js", "**/*.ts", "**/*.jsx", "**/*.tsx"],
+              ignores: ["**/node_modules/**", "**/.venv/**", "**/dist/**", "**/build/**"],
+              plugins: { "no-secrets": noSecrets },
+              rules: { "no-secrets/no-secrets": "error" },
+            },
+          ];
+          ESLINTEOF
+
+          "$ESLINT_DIR/node_modules/.bin/eslint" \
+            --config "$ESLINT_DIR/eslint.config.mjs" \
+            --format json \
+            --output-file eslint-security.json \
+            .
+
+      - name: Snyk security scan (optional)
+        if: hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json') != ''
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo "SNYK_TOKEN not configured; skipping Snyk scan."
+            exit 0
+          fi
+          npx --yes snyk@1.1302.1 auth "$SNYK_TOKEN"
+          npx --yes snyk@1.1302.1 test --all-projects --severity-threshold=low --json-file-output=snyk-report.json
+
+      - name: Upload JS security reports
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: javascript-security-reports
+          path: |
+            npm-audit-reports/*.json
+            retirejs-report.json
+            eslint-security.json
+            snyk-report.json
+          if-no-files-found: ignore
+
+  semgrep-sast:
+    name: 🔍 Semgrep OSS SAST
+    needs: detect-languages
+    if: needs.detect-languages.outputs.has_python == 'true' || needs.detect-languages.outputs.has_javascript == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:1.151.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run Semgrep (JSON, strict)
+        run: |
+          semgrep scan \
+            --config auto \
+            --error \
+            --json \
+            --output semgrep.json \
+            --exclude .venv \
+            --exclude venv \
+            --exclude node_modules \
+            --exclude dist \
+            --exclude build \
+            .
+
+      - name: Run Semgrep (SARIF)
+        if: always()
+        run: |
+          semgrep scan \
+            --config auto \
+            --sarif \
+            --output semgrep.sarif \
+            --exclude .venv \
+            --exclude venv \
+            --exclude node_modules \
+            --exclude dist \
+            --exclude build \
+            .
+
+      - name: Run Semgrep custom rules
+        if: always() && hashFiles('.semgrep/rules/*.yml', '.semgrep/rules/*.yaml') != ''
+        run: |
+          semgrep scan \
+            --config .semgrep/rules \
+            --sarif \
+            --output semgrep-custom.sarif \
+            --exclude .venv \
+            --exclude venv \
+            --exclude node_modules \
+            --exclude dist \
+            --exclude build \
+            .
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        if: always() && hashFiles('semgrep.sarif') != ''
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload custom Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        if: always() && hashFiles('semgrep-custom.sarif') != ''
+        with:
+          sarif_file: semgrep-custom.sarif
+          category: semgrep-custom
+
+      - name: Upload Semgrep artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: semgrep-reports
+          path: |
+            semgrep.json
+            semgrep.sarif
+            semgrep-custom.sarif
+          if-no-files-found: ignore
+
+  trivy-scan:
+    name: 🛡️ Trivy Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Trivy filesystem scan (strict)
+        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'HIGH,CRITICAL'
+          exit-code: 1
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        with:
+          sarif_file: 'trivy-fs.sarif'
+          category: 'trivy-filesystem'
+
+      - name: Upload Trivy artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-fs.sarif
+          if-no-files-found: ignore
+
+  security-scorecard:
+    name: 🏆 OSSF Security Scorecard
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        if: always() && hashFiles('scorecard-results.sarif') != ''
+        with:
+          sarif_file: scorecard-results.sarif
+          category: scorecard
+
+      - name: Upload Scorecard artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: scorecard-report
+          path: scorecard-results.sarif
+          if-no-files-found: ignore
+
+  generate-summary:
+    name: 📋 Generate Summary
+    needs: [detect-languages, python-security, javascript-security, semgrep-sast, trivy-scan, security-scorecard]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Create summary
+        run: |
+          echo "# 🔒 Security Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Project Detection" >> $GITHUB_STEP_SUMMARY
+          echo "- Python: ${{ needs.detect-languages.outputs.has_python == 'true' && '✅ Yes' || '❌ No' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- JavaScript: ${{ needs.detect-languages.outputs.has_javascript == 'true' && '✅ Yes' || '❌ No' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- requirements*.txt: ${{ needs.detect-languages.outputs.has_requirements == 'true' && '✅ Found' || '❌ Not found' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- pyproject.toml: ${{ needs.detect-languages.outputs.has_pyproject == 'true' && '✅ Found' || '❌ Not found' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- package.json: ${{ needs.detect-languages.outputs.has_package_json == 'true' && '✅ Found' || '❌ Not found' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "- Python Security: ${{ needs.python-security.result == 'success' && '✅' || needs.python-security.result == 'skipped' && '⏭️ Skipped' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- JavaScript Security: ${{ needs.javascript-security.result == 'success' && '✅' || needs.javascript-security.result == 'skipped' && '⏭️ Skipped' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Semgrep SAST: ${{ needs.semgrep-sast.result == 'success' && '✅' || needs.semgrep-sast.result == 'skipped' && '⏭️ Skipped' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Trivy: ${{ needs.trivy-scan.result == 'success' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- OSSF Scorecard: ${{ needs.security-scorecard.result == 'success' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
