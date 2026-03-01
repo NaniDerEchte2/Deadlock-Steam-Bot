@@ -38,7 +38,7 @@ def make_link_embed(
     if show_why:
         lines += [
             "**Warum verknüpfen?**",
-            "Dein Rang wird automatisch auf dem Server angezeigt und der Live-Status in den Voice Lanes funktioniert nur mit verknüpftem Account.",
+            "Mit verknüpftem Account werden dein Rang, dein Live-Status in den Voice Lanes und die Spielersuche korrekt angezeigt.",
             "",
         ]
 

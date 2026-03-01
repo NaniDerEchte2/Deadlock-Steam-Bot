@@ -514,9 +514,10 @@ class SteamLink(commands.Cog):
                 return
             await self._cleanup_recent_bot_dms(user, limit=25)
             shine = (
-                "✨ **Connection complete.**\n"
-                "🤝 Bitte sende dem Steam-Bot jetzt eine Freundschaftsanfrage Freundescode: **820142646**." 
-                "Sobald die Freundschaft besteht, wird deine Verknüpfung aktiv und wir erkennen deinen Rang."
+                "✅ **Steam-Verknüpfung erfolgreich.**\n"
+                "Diese Verknüpfung ist wichtig für deinen Rang, den Live-Status in den Voice Lanes und die Spielersuche.\n"
+                "🤝 Bitte sende dem Steam-Bot jetzt eine Freundschaftsanfrage "
+                "(Freundescode: **820142646**), damit die Verknüpfung vollständig aktiv wird."
             )
             await user.send(shine)
         except Exception as e:

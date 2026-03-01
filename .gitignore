@@ -22,3 +22,4 @@ tmp/
 npm-debug.log*
 yarn-error.log*
 *.tgz
+/logs

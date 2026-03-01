@@ -59,6 +59,7 @@ class SteamLinkPanelView(discord.ui.View):
         uid = interaction.user.id
         desc = (
             "Verknüpfe deinen Steam-Account direkt über Steam OpenID.\n\n"
+            "Das ist wichtig für korrekten Rang, den Live-Status in den Voice Lanes und die Spielersuche.\n\n"
             "Wichtig: Sende dem Steam-Bot direkt eine Freundschaftsanfrage (Freundescode **820142646**), "
             "sonst kann die Verknüpfung nicht abgeschlossen werden.\n\n"
             "Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>"
