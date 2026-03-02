@@ -433,6 +433,15 @@ class DeadlockFriendRank(commands.Cog):
             out[(rank_value, subrank)] = role_id
         return out
 
+    def _managed_rank_role_ids_for_guild(
+        self,
+        guild: discord.Guild,
+        subrank_role_map: dict[tuple[int, int], int],
+    ) -> set[int]:
+        mapped_subrank_role_ids = {role_id for role_id in subrank_role_map.values() if role_id > 0}
+        all_subrank_ids = mapped_subrank_role_ids | self._collect_subrank_role_ids(guild)
+        return set(RANK_ROLE_ID_SET | all_subrank_ids)
+
     def _resolve_lookup_target(
         self,
         author_id: int,
@@ -781,11 +790,8 @@ class DeadlockFriendRank(commands.Cog):
             target_role = None
 
         # 2. Identify roles to remove (all other rank/subrank roles)
-        mapped_subrank_role_ids = {role_id for role_id in subrank_role_map.values() if role_id > 0}
-        all_subrank_ids = mapped_subrank_role_ids | self._collect_subrank_role_ids(guild)
-
         # Combined set of all roles we manage (old main roles + all possible subranks)
-        managed_role_ids = RANK_ROLE_ID_SET | all_subrank_ids
+        managed_role_ids = self._managed_rank_role_ids_for_guild(guild, subrank_role_map)
 
         roles_to_remove = [
             role
@@ -843,6 +849,66 @@ class DeadlockFriendRank(commands.Cog):
                     subrank_role_maps.get(guild.id, {}),
                     stats,
                 )
+
+    async def remove_rank_roles_for_users(
+        self,
+        user_ids: list[int] | set[int],
+        *,
+        reason: str = "Deadlock rank cleanup",
+    ) -> int:
+        """Remove all managed rank/subrank roles for a set of Discord users."""
+        target_ids: list[int] = []
+        for raw_id in user_ids:
+            uid = self._safe_int(raw_id)
+            if uid is None or uid < MIN_DISCORD_SNOWFLAKE:
+                continue
+            target_ids.append(uid)
+        if not target_ids:
+            return 0
+
+        unique_target_ids = sorted(set(target_ids))
+        removed_total = 0
+
+        async with self._sync_lock:
+            target_guilds = self._target_guilds_for_rank_roles()
+            if not target_guilds:
+                return 0
+
+            for guild in target_guilds:
+                me = guild.me
+                if me is None or not me.guild_permissions.manage_roles:
+                    continue
+
+                subrank_role_map = await self._load_subrank_role_map_for_guild(guild.id)
+                managed_role_ids = self._managed_rank_role_ids_for_guild(guild, subrank_role_map)
+                if not managed_role_ids:
+                    continue
+
+                for user_id in unique_target_ids:
+                    member = await self._resolve_member(guild, user_id)
+                    if member is None:
+                        continue
+
+                    roles_to_remove = [
+                        role
+                        for role in member.roles
+                        if role.id in managed_role_ids and role.position < me.top_role.position
+                    ]
+                    if not roles_to_remove:
+                        continue
+
+                    try:
+                        await member.remove_roles(*roles_to_remove, reason=reason)
+                        removed_total += len(roles_to_remove)
+                    except discord.HTTPException as exc:
+                        log.warning(
+                            "Failed to cleanup rank roles for %s in guild %s: %s",
+                            member.id,
+                            guild.id,
+                            exc,
+                        )
+
+        return removed_total
 
     async def _run_friend_rank_sync(self, *, trigger: str) -> SyncStats:
         del trigger

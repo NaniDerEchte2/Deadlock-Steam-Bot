@@ -21,6 +21,8 @@ from service.config import settings
 
 log = logging.getLogger(__name__)
 
+MIN_DISCORD_SNOWFLAKE = 10_000_000_000_000_000
+
 
 def _save_steam_friend_to_db(steam_id64: str, discord_id: int | None = None) -> set[int]:
     """
@@ -110,7 +112,13 @@ async def sync_all_friends(tasks: SteamTaskClient | None = None) -> dict:
         if not outcome.ok:
             error_msg = outcome.error or "Failed to get friends list"
             log.error("Failed to get friends list: %s", error_msg)
-            return {"success": False, "count": 0, "cleared_count": 0, "error": error_msg}
+            return {
+                "success": False,
+                "count": 0,
+                "cleared_count": 0,
+                "fully_unfollowed_user_ids": [],
+                "error": error_msg,
+            }
 
         if not outcome.result or not isinstance(outcome.result, dict):
             log.error("Invalid result format from AUTH_GET_FRIENDS_LIST")
@@ -118,17 +126,26 @@ async def sync_all_friends(tasks: SteamTaskClient | None = None) -> dict:
                 "success": False,
                 "count": 0,
                 "cleared_count": 0,
+                "fully_unfollowed_user_ids": [],
                 "error": "Invalid result format",
             }
 
         data = outcome.result.get("data", {})
         friends = data.get("friends", [])
+        if not isinstance(friends, list):
+            log.error("Invalid friends format from AUTH_GET_FRIENDS_LIST")
+            return {
+                "success": False,
+                "count": 0,
+                "cleared_count": 0,
+                "fully_unfollowed_user_ids": [],
+                "error": "Invalid friends format",
+            }
 
         if not friends:
             log.warning("No friends found in Steam bot's friend list")
-            return {"success": True, "count": 0, "cleared_count": 0, "error": None}
-
-        log.info("Found %d friends, syncing to database...", len(friends))
+        else:
+            log.info("Found %d friends, syncing to database...", len(friends))
 
         # Sync each friend to database
         synced = 0
@@ -150,32 +167,79 @@ async def sync_all_friends(tasks: SteamTaskClient | None = None) -> dict:
         # Cleanup: is_steam_friend=0 für Steam-IDs die nicht mehr in der Freundesliste sind
         friend_steam_ids = [f.get("steam_id64") for f in friends if f.get("steam_id64")]
         cleared = 0
-        if friend_steam_ids:
-            ids_json = json.dumps(friend_steam_ids)
-            with db.get_conn() as conn:
-                cleared = conn.execute(
+        ids_json = json.dumps(friend_steam_ids)
+        fully_unfollowed_user_ids: list[int] = []
+        with db.get_conn() as conn:
+            candidate_rows = conn.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM steam_links
+                WHERE is_steam_friend=1
+                  AND steam_id NOT IN (SELECT value FROM json_each(?))
+                  AND user_id >= ?
+                """,
+                (ids_json, MIN_DISCORD_SNOWFLAKE),
+            ).fetchall()
+            candidate_user_ids = {
+                int(row["user_id"])
+                for row in candidate_rows
+                if row and row["user_id"] is not None
+            }
+
+            cleared = conn.execute(
+                """
+                UPDATE steam_links
+                SET is_steam_friend=0, updated_at=CURRENT_TIMESTAMP
+                WHERE is_steam_friend=1
+                  AND steam_id NOT IN (SELECT value FROM json_each(?))
+                """,
+                (ids_json,),
+            ).rowcount
+
+            if candidate_user_ids:
+                candidate_json = json.dumps(sorted(candidate_user_ids))
+                still_friend_rows = conn.execute(
                     """
-                    UPDATE steam_links
-                    SET is_steam_friend=0, updated_at=CURRENT_TIMESTAMP
-                    WHERE is_steam_friend=1
-                      AND steam_id NOT IN (SELECT value FROM json_each(?))
+                    SELECT DISTINCT user_id
+                    FROM steam_links
+                    WHERE user_id IN (SELECT value FROM json_each(?))
+                      AND is_steam_friend=1
                     """,
-                    (ids_json,),
-                ).rowcount
-            if cleared:
-                log.info("Cleared is_steam_friend for %d removed friends", cleared)
+                    (candidate_json,),
+                ).fetchall()
+                still_friend_ids = {
+                    int(row["user_id"])
+                    for row in still_friend_rows
+                    if row and row["user_id"] is not None
+                }
+                fully_unfollowed_user_ids = sorted(candidate_user_ids - still_friend_ids)
+
+        if cleared:
+            log.info("Cleared is_steam_friend for %d removed friends", cleared)
+        if fully_unfollowed_user_ids:
+            log.info(
+                "Users with no remaining Steam friendship: %d",
+                len(fully_unfollowed_user_ids),
+            )
 
         return {
             "success": True,
             "count": synced,
             "cleared_count": cleared,
+            "fully_unfollowed_user_ids": fully_unfollowed_user_ids,
             "newly_verified_ids": list(newly_verified_ids),
             "error": None,
         }
 
     except Exception as e:
         log.exception("Failed to sync friends")
-        return {"success": False, "count": 0, "cleared_count": 0, "error": str(e)}
+        return {
+            "success": False,
+            "count": 0,
+            "cleared_count": 0,
+            "fully_unfollowed_user_ids": [],
+            "error": str(e),
+        }
 
 
 class SteamFriendsSync(commands.Cog):
@@ -208,6 +272,31 @@ class SteamFriendsSync(commands.Cog):
             log.warning("SteamFriendsSync: Guild-Command-Sync Timeout (>20s) – wird übersprungen")
         except Exception as exc:
             log.warning("SteamFriendsSync: Guild-Command-Sync fehlgeschlagen: %s", exc)
+
+    async def _cleanup_rank_roles_for_unfollowed_users(self, user_ids: list[int]) -> int:
+        targets = sorted(
+            {
+                int(uid)
+                for uid in user_ids
+                if isinstance(uid, int) and uid >= MIN_DISCORD_SNOWFLAKE
+            }
+        )
+        if not targets:
+            return 0
+
+        rank_cog = self.bot.get_cog("DeadlockFriendRank")
+        if rank_cog is None or not hasattr(rank_cog, "remove_rank_roles_for_users"):
+            return 0
+
+        try:
+            removed = await rank_cog.remove_rank_roles_for_users(
+                targets,
+                reason="Steam unfollow cleanup",
+            )
+            return int(removed or 0)
+        except Exception as exc:
+            log.warning("Rank-Rollen-Cleanup nach Unfollow fehlgeschlagen: %s", exc)
+            return 0
 
     @tasks.loop(hours=6)
     async def periodic_sync(self) -> None:
@@ -247,10 +336,15 @@ class SteamFriendsSync(commands.Cog):
         except Exception as exc:
             log.warning("Rolle-Update nach periodischem Sync fehlgeschlagen: %s", exc)
 
+        rank_cleanup_count = await self._cleanup_rank_roles_for_unfollowed_users(
+            result.get("fully_unfollowed_user_ids", [])
+        )
+
         log.info(
-            "Periodischer Sync abgeschlossen: %d Freunde, Sofort-Rollen=%d",
+            "Periodischer Sync abgeschlossen: %d Freunde, Sofort-Rollen=%d, Rangrollen-Cleanup=%d",
             result["count"],
             immediate,
+            rank_cleanup_count,
         )
 
     @periodic_sync.before_loop
@@ -311,12 +405,18 @@ class SteamFriendsSync(commands.Cog):
         except Exception as exc:
             log.warning("Rolle-Update nach Sync fehlgeschlagen: %s", exc)
 
+        rank_cleanup_count = await self._cleanup_rank_roles_for_unfollowed_users(
+            result.get("fully_unfollowed_user_ids", [])
+        )
+
         lines = [
             f"**Steam-Freunde synchronisiert:** {synced}",
             f"**Sofort verifizierte Rollen vergeben:** {immediate}",
         ]
         if cleared:
             lines.append(f"**Freundschaften beendet (is_steam_friend=0):** {cleared}")
+        if rank_cleanup_count:
+            lines.append(f"**Rang-Rollen entfernt (Unfollow):** {rank_cleanup_count}")
         lines.append(f"**Rollen-Updates:** {role_changes}")
 
         await interaction.followup.send("\n".join(lines), ephemeral=True)
