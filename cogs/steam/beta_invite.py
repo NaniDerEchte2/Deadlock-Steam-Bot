@@ -37,6 +37,15 @@ except Exception:  # pragma: no cover - optional dependency in some environments
 
 SUPPORT_CHANNEL = "https://discord.com/channels/1289721245281292288/1459628609705738539"
 BETA_INVITE_CHANNEL_URL = "https://discord.com/channels/1289721245281292288/1464736918951432222"
+STEAM_BOT_FRIEND_CODE = (
+    str(
+        os.getenv(
+            "STEAM_BOT_FRIEND_CODE",
+            getattr(welcome_base, "STEAM_BOT_FRIEND_CODE", "820142646"),
+        )
+    ).strip()
+    or "820142646"
+)
 
 BETA_INVITE_SUPPORT_CONTACT = getattr(
     welcome_base,
@@ -128,6 +137,34 @@ def _preview_text(value: Any, *, max_len: int = 700) -> str | None:
     if len(text) <= max_len:
         return text
     return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
+
+
+def _is_friend_request_rate_limited(error_text: str | None) -> bool:
+    low = str(error_text or "").lower()
+    if not low:
+        return False
+    tokens = (
+        "ratelimitexceeded",
+        "rate limit",
+        "ratelimit",
+        "too many request",
+        "toomanyrequests",
+        "eresultlimitexceeded",
+        "limit exceeded",
+        "flood",
+    )
+    return any(token in low for token in tokens)
+
+
+def _manual_friend_request_workaround_text() -> str:
+    return (
+        "⚠️ Der Bot konnte die Steam-Freundschaftsanfrage gerade nicht automatisch senden "
+        "(Steam/Service-Limit).\n"
+        f"Sende dem Steam-Bot bitte manuell eine Freundschaftsanfrage "
+        f"(Freundescode `{STEAM_BOT_FRIEND_CODE}`).\n"
+        'Danach klicke hier auf "Freundschaft bestätigt", dann geht dein Invite direkt weiter.\n'
+        "Falls es weiterhin nicht klappt: 30-60 Minuten warten und dann erneut versuchen."
+    )
 
 
 def _view_snapshot(view: Any) -> dict[str, Any] | None:
@@ -1932,14 +1969,22 @@ class BetaInviteFlow(commands.Cog):
                 steam_id64=resolved,
                 error=str(exc),
             )
-            _update_invite(
-                record.id,
-                status=STATUS_ERROR,
-                last_error=f"Freundschaftsanfrage fehlgeschlagen: {exc}",
+            now_ts = int(time.time())
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_WAITING,
+                    account_id=account_id,
+                    friend_requested_at=now_ts,
+                    last_error=f"Freundschaftsanfrage fehlgeschlagen: {exc}",
+                )
+                or record
             )
+            view = BetaInviteConfirmView(self, record.id, interaction.user.id, resolved)
             await self._followup_send(
                 interaction,
-                "⚠️ Konnte die Freundschaftsanfrage nicht senden. Bitte versuche es später erneut.",
+                _manual_friend_request_workaround_text(),
+                view=view,
                 ephemeral=True,
             )
             return
@@ -1949,6 +1994,7 @@ class BetaInviteFlow(commands.Cog):
                 fr_outcome.error or "Unbekannter Fehler beim Senden der Freundschaftsanfrage"
             )
             error_lower = str(error_msg).lower()
+            rate_limited = _is_friend_request_rate_limited(error_msg)
             duplicate_request = any(
                 token in error_lower
                 for token in (
@@ -2041,6 +2087,39 @@ class BetaInviteFlow(commands.Cog):
                 await self._followup_send(interaction, message, view=view, ephemeral=True)
                 return
 
+            if rate_limited:
+                log.warning(
+                    "Freundschaftsanfrage rate-limited: discord_id=%s, steam_id=%s, error=%s",
+                    interaction.user.id,
+                    resolved,
+                    error_msg,
+                )
+                _trace(
+                    "friend_request_rate_limited",
+                    discord_id=interaction.user.id,
+                    steam_id64=resolved,
+                    error=error_msg,
+                )
+                now_ts = int(time.time())
+                record = (
+                    _update_invite(
+                        record.id,
+                        status=STATUS_WAITING,
+                        account_id=account_id,
+                        friend_requested_at=now_ts,
+                        last_error=f"Freundschaftsanfrage rate-limited: {error_msg}",
+                    )
+                    or record
+                )
+                view = BetaInviteConfirmView(self, record.id, interaction.user.id, resolved)
+                await self._followup_send(
+                    interaction,
+                    _manual_friend_request_workaround_text(),
+                    view=view,
+                    ephemeral=True,
+                )
+                return
+
             log.warning(
                 "Freundschaftsanfrage fehlgeschlagen: discord_id=%s, steam_id=%s, error=%s",
                 interaction.user.id,
@@ -2053,14 +2132,22 @@ class BetaInviteFlow(commands.Cog):
                 steam_id64=resolved,
                 error=error_msg,
             )
-            _update_invite(
-                record.id,
-                status=STATUS_ERROR,
-                last_error=f"Freundschaftsanfrage fehlgeschlagen: {error_msg}",
+            now_ts = int(time.time())
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_WAITING,
+                    account_id=account_id,
+                    friend_requested_at=now_ts,
+                    last_error=f"Freundschaftsanfrage fehlgeschlagen: {error_msg}",
+                )
+                or record
             )
+            view = BetaInviteConfirmView(self, record.id, interaction.user.id, resolved)
             await self._followup_send(
                 interaction,
-                "⚠️ Konnte die Freundschaftsanfrage nicht senden. Bitte prüfe deine Steam-Privatsphäreeinstellungen und versuche es erneut.",
+                _manual_friend_request_workaround_text(),
+                view=view,
                 ephemeral=True,
             )
             return
