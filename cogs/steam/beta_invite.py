@@ -2722,8 +2722,8 @@ class BetaInviteFlow(commands.Cog):
                 _trace("betainvite_no_link", discord_id=interaction.user.id)
                 return
 
-            # Wenn verknüpft: Sofort verifiziert setzen und Rolle geben
-            await self._sync_verified_on_friendship(interaction.user.id, steam_id)
+            # Nur eine vorhandene Steam-Verknüpfung reicht nicht aus:
+            # verified/is_steam_friend wird erst nach bestätigter Freundschaft gesetzt.
 
             # 2. Intent prüfen / abfragen
             intent_record = _get_intent_record(interaction.user.id)
