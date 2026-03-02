@@ -5,6 +5,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import time
@@ -54,12 +55,31 @@ BETA_INVITE_SUPPORT_CONTACT = getattr(
 )
 BETA_MAIN_GUILD_ID = getattr(welcome_base, "MAIN_GUILD_ID", None)
 BETA_INVITE_PANEL_CUSTOM_ID = "betainvite:panel:start"
+BETA_INVITE_TICKET_CATEGORY_ID = 1478024871056248975
+BETA_INVITE_TICKET_NAME_PREFIX = "beta-invite"
 KOFI_VERIFICATION_TOKEN = os.getenv("KOFI_VERIFICATION_TOKEN")
+
+BETA_TICKET_STATUS_OPEN = "open"
+BETA_TICKET_STATUS_COMPLETED = "completed"
+BETA_TICKET_STATUS_CLOSED = "closed"
+BETA_TICKET_REUSABLE_STATUSES = {
+    BETA_TICKET_STATUS_OPEN,
+    BETA_TICKET_STATUS_COMPLETED,
+}
 
 EXPRESS_SUCCESS_DM = (
     "Vielen Dank für deinen Support! 🚑 Dein Deadlock-Invite wird jetzt verarbeitet."
 )
 STEAM_LINK_REQUIRED_DM = "Zahlung erhalten! Aber du musst erst deinen Steam-Account verknüpfen. Nutze danach /betainvite oder klicke im Panel auf Weiter."
+
+BETA_INVITE_STEAM_LINK_STEP_TEXT = (
+    "Bevor wir fortfahren können, musst du deinen Steam-Account verknüpfen.\n"
+    "Nutze den Steam-Login unten. Sobald du fertig bist, klicke auf **Weiter**.\n"
+)
+BETA_INVITE_STEAM_LINK_MISSING_TEXT = (
+    "🚨 Es ist noch kein Steam-Account mit deinem Discord verknüpft.\n"
+    "Melde dich mit den unten verfügbaren Optionen bei Steam an. Sobald du fertig bist, klicke auf **Weiter**."
+)
 
 
 def _make_payment_message(token: str) -> str:
@@ -418,6 +438,133 @@ def _ensure_invite_audit_table() -> None:
             )
             """
         )
+
+
+def _ensure_beta_invite_tickets_table() -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS beta_invite_tickets (
+                discord_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                closed_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_beta_invite_tickets_channel ON beta_invite_tickets(channel_id)"
+        )
+
+
+@dataclass(slots=True)
+class BetaInviteTicketRecord:
+    discord_id: int
+    guild_id: int
+    channel_id: int
+    status: str
+    created_at: int
+    updated_at: int
+    closed_at: int | None
+
+
+def _ticket_row_to_record(
+    row: db.sqlite3.Row | None,
+) -> BetaInviteTicketRecord | None:  # type: ignore[attr-defined]
+    if row is None:
+        return None
+    return BetaInviteTicketRecord(
+        discord_id=int(row["discord_id"]),
+        guild_id=int(row["guild_id"]),
+        channel_id=int(row["channel_id"]),
+        status=str(row["status"]),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+        closed_at=int(row["closed_at"]) if row["closed_at"] is not None else None,
+    )
+
+
+def _fetch_ticket_by_discord(discord_id: int) -> BetaInviteTicketRecord | None:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT discord_id, guild_id, channel_id, status, created_at, updated_at, closed_at
+            FROM beta_invite_tickets
+            WHERE discord_id = ?
+            """,
+            (int(discord_id),),
+        ).fetchone()
+    return _ticket_row_to_record(row)
+
+
+def _fetch_ticket_by_channel(channel_id: int) -> BetaInviteTicketRecord | None:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT discord_id, guild_id, channel_id, status, created_at, updated_at, closed_at
+            FROM beta_invite_tickets
+            WHERE channel_id = ?
+            LIMIT 1
+            """,
+            (int(channel_id),),
+        ).fetchone()
+    return _ticket_row_to_record(row)
+
+
+def _upsert_ticket_for_user(
+    discord_id: int,
+    guild_id: int,
+    channel_id: int,
+    status: str,
+    *,
+    closed_at: int | None = None,
+) -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO beta_invite_tickets(discord_id, guild_id, channel_id, status, closed_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                channel_id = excluded.channel_id,
+                status = excluded.status,
+                updated_at = (strftime('%s','now')),
+                closed_at = excluded.closed_at
+            """,
+            (
+                int(discord_id),
+                int(guild_id),
+                int(channel_id),
+                str(status),
+                int(closed_at) if closed_at is not None else None,
+            ),
+        )
+
+
+def _set_ticket_status(discord_id: int, status: str, *, closed_at: int | None = None) -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE beta_invite_tickets
+            SET status = ?, updated_at = (strftime('%s','now')), closed_at = ?
+            WHERE discord_id = ?
+            """,
+            (
+                str(status),
+                int(closed_at) if closed_at is not None else None,
+                int(discord_id),
+            ),
+        )
+
+
+def _is_reusable_ticket_channel(channel_id: int) -> bool:
+    record = _fetch_ticket_by_channel(channel_id)
+    if record is None:
+        return False
+    return record.status in BETA_TICKET_REUSABLE_STATUSES
 
 
 def _format_discord_name(user: discord.abc.User) -> str:
@@ -1034,10 +1181,13 @@ class BetaInviteLinkPromptView(discord.ui.View):
         cog: BetaInviteFlow,
         user_id: int,
         steam_url: str | None,
+        *,
+        next_handler: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
+        self.next_handler = next_handler
 
         if steam_url:
             self.add_item(
@@ -1089,8 +1239,49 @@ class BetaInviteLinkPromptView(discord.ui.View):
                 exc,
             )
 
-        # Den Flow erneut starten (der nun die Verknüpfung finden sollte)
+        # Den nächsten Schritt starten
+        if self.next_handler is not None:
+            await self.next_handler(interaction)
+            return
         await self.cog.start_invite_from_panel(interaction)
+
+
+class BetaInviteFriendHintView(discord.ui.View):
+    def __init__(self, cog: BetaInviteFlow, user_id: int) -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.user_id = user_id
+
+    @discord.ui.button(
+        label="Freundschaft bestätigt",
+        style=discord.ButtonStyle.success,
+        emoji="🤝",
+    )
+    async def confirm_friendship(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        self.cog._trace_user_action(interaction, "friend_hint.confirm_clicked")
+        if interaction.user.id != self.user_id:
+            await self.cog._response_send_message(
+                interaction,
+                "Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await self.cog._response_edit_message(
+                interaction,
+                content="⏳ Status wird geprüft... Bitte warten.",
+                view=None,
+            )
+        except Exception as exc:
+            log.debug(
+                "Friend hint status message could not be updated before intent step: %s",
+                exc,
+            )
+
+        await self.cog._continue_ticket_after_friend_hint(interaction)
 
 
 class BetaInviteConfirmView(discord.ui.View):
@@ -1171,7 +1362,9 @@ class BetaInviteFlow(commands.Cog):
         self._kofi_webhook_task: asyncio.Task | None = None
         self._kofi_server = None
         self._log_channel_cache: discord.abc.Messageable | None = None
+        self._ticket_locks: dict[int, asyncio.Lock] = {}
         _ensure_invite_audit_table()
+        _ensure_beta_invite_tickets_table()
 
     def _trace_user_action(
         self,
@@ -1180,6 +1373,339 @@ class BetaInviteFlow(commands.Cog):
         **fields: Any,
     ) -> None:
         _trace_interaction_event("ui_action", interaction, action=action, **fields)
+
+    def _ticket_lock_for_user(self, discord_id: int) -> asyncio.Lock:
+        lock = self._ticket_locks.get(int(discord_id))
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ticket_locks[int(discord_id)] = lock
+        return lock
+
+    async def _resolve_ticket_category(
+        self, guild: discord.Guild, interaction: discord.Interaction
+    ) -> discord.CategoryChannel | None:
+        target = guild.get_channel(BETA_INVITE_TICKET_CATEGORY_ID)
+        if target is None:
+            try:
+                fetched = await self.bot.fetch_channel(BETA_INVITE_TICKET_CATEGORY_ID)
+                if getattr(fetched, "guild", None) and fetched.guild.id == guild.id:
+                    target = fetched
+            except Exception:
+                target = None
+
+        if isinstance(target, discord.CategoryChannel):
+            return target
+        if isinstance(target, (discord.TextChannel, discord.ForumChannel, discord.Thread)):
+            return target.category
+
+        channel = interaction.channel
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel.category
+        return None
+
+    def _build_ticket_channel_name(self, user: discord.abc.User) -> str:
+        base = re.sub(r"[^a-z0-9-]+", "-", str(getattr(user, "name", "user")).lower()).strip("-")
+        if not base:
+            base = "user"
+        max_base_len = 90 - len(BETA_INVITE_TICKET_NAME_PREFIX) - 1
+        safe_base = base[: max(8, max_base_len)]
+        return f"{BETA_INVITE_TICKET_NAME_PREFIX}-{safe_base}"
+
+    def _build_ticket_overwrites(
+        self,
+        guild: discord.Guild,
+        user: discord.abc.User,
+    ) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+        user_overwrite = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+            add_reactions=True,
+        )
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: user_overwrite,
+        }
+
+        bot_member = guild.me
+        if bot_member is None and self.bot.user is not None:
+            bot_member = guild.get_member(self.bot.user.id)
+        if bot_member is not None:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+                attach_files=True,
+                embed_links=True,
+                add_reactions=True,
+            )
+
+        staff_role_ids = tuple(
+            int(role_id) for role_id in getattr(welcome_base, "WELCOME_DM_TEST_ROLE_IDS", ()) or ()
+        )
+        for role_id in staff_role_ids:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+            )
+
+        for role in guild.roles:
+            if role.is_default():
+                continue
+            perms = role.permissions
+            if not (perms.administrator or perms.manage_guild or perms.manage_channels):
+                continue
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+                manage_channels=True,
+            )
+
+        return overwrites
+
+    async def start_or_reuse_ticket_for_user(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[discord.TextChannel, bool] | None:
+        guild = interaction.guild
+        if guild is None:
+            return None
+
+        lock = self._ticket_lock_for_user(interaction.user.id)
+        async with lock:
+            existing = _fetch_ticket_by_discord(interaction.user.id)
+            if existing and existing.status in BETA_TICKET_REUSABLE_STATUSES:
+                channel_obj = guild.get_channel(existing.channel_id)
+                if channel_obj is None:
+                    try:
+                        fetched = await self.bot.fetch_channel(existing.channel_id)
+                        if isinstance(fetched, discord.TextChannel) and fetched.guild.id == guild.id:
+                            channel_obj = fetched
+                    except Exception:
+                        channel_obj = None
+                if isinstance(channel_obj, discord.TextChannel):
+                    _upsert_ticket_for_user(
+                        interaction.user.id,
+                        guild.id,
+                        channel_obj.id,
+                        existing.status,
+                        closed_at=existing.closed_at,
+                    )
+                    return channel_obj, False
+                _set_ticket_status(
+                    interaction.user.id,
+                    BETA_TICKET_STATUS_CLOSED,
+                    closed_at=int(time.time()),
+                )
+
+            category = await self._resolve_ticket_category(guild, interaction)
+            overwrites = self._build_ticket_overwrites(guild, interaction.user)
+            channel = await guild.create_text_channel(
+                name=self._build_ticket_channel_name(interaction.user),
+                category=category,
+                overwrites=overwrites,
+                reason=f"Beta-Invite Ticket für {interaction.user} ({interaction.user.id})",
+            )
+            _upsert_ticket_for_user(
+                interaction.user.id,
+                guild.id,
+                channel.id,
+                BETA_TICKET_STATUS_OPEN,
+            )
+            return channel, True
+
+    def _is_beta_ticket_interaction(self, interaction: discord.Interaction | None) -> bool:
+        if interaction is None:
+            return False
+        channel = getattr(interaction, "channel", None)
+        channel_id = getattr(channel, "id", None) or getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            return False
+        try:
+            return _is_reusable_ticket_channel(int(channel_id))
+        except Exception:
+            return False
+
+    def _effective_ephemeral(
+        self,
+        interaction: discord.Interaction | None,
+        requested_ephemeral: bool,
+    ) -> bool:
+        if not requested_ephemeral:
+            return False
+        return not self._is_beta_ticket_interaction(interaction)
+
+    async def _lookup_steam_link_with_retry(self, discord_id: int) -> str | None:
+        steam_id = _lookup_primary_steam_id(discord_id)
+        if steam_id:
+            return steam_id
+        for _ in range(5):
+            await asyncio.sleep(3)
+            steam_id = _lookup_primary_steam_id(discord_id)
+            if steam_id:
+                return steam_id
+        return None
+
+    async def _send_ticket_steam_link_step(
+        self,
+        channel: discord.TextChannel,
+        user: discord.abc.User,
+        *,
+        interaction: discord.Interaction | None = None,
+    ) -> None:
+        view = self._build_link_prompt_view(
+            user,
+            next_handler=self._continue_ticket_after_steam_link,
+        )
+        await self._send_channel_message(
+            channel,
+            content=BETA_INVITE_STEAM_LINK_STEP_TEXT,
+            view=view,
+            interaction=interaction,
+        )
+
+    async def _send_ticket_friend_hint_step(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        view = BetaInviteFriendHintView(self, interaction.user.id)
+        await self._edit_original_response(
+            interaction,
+            content=_manual_friend_request_workaround_text(),
+            view=view,
+        )
+
+    async def _continue_ticket_after_steam_link(self, interaction: discord.Interaction) -> None:
+        self._trace_user_action(interaction, "ticket.step_steam_link_continue")
+        steam_id = await self._lookup_steam_link_with_retry(interaction.user.id)
+        if not steam_id:
+            view = self._build_link_prompt_view(
+                interaction.user,
+                next_handler=self._continue_ticket_after_steam_link,
+            )
+            await self._edit_original_response(
+                interaction,
+                content=BETA_INVITE_STEAM_LINK_MISSING_TEXT,
+                view=view,
+            )
+            _trace("betainvite_no_link", discord_id=interaction.user.id)
+            return
+
+        await self._send_ticket_friend_hint_step(interaction)
+
+    async def _continue_ticket_after_friend_hint(self, interaction: discord.Interaction) -> None:
+        self._trace_user_action(interaction, "ticket.step_friend_hint_continue")
+        intent_record = _get_intent_record(interaction.user.id)
+        if intent_record is None:
+            await self._prompt_intent_gate(interaction)
+            return
+
+        if intent_record.intent == INTENT_INVITE_ONLY:
+            payment_token = _register_pending_payment(interaction.user.id, interaction.user.name)
+            view = InviteOnlyPaymentView(KOFI_PAYMENT_URL)
+            await self._edit_original_response(
+                interaction,
+                content=_make_payment_message(payment_token),
+                view=view,
+            )
+            self._mark_ticket_completed(interaction.user.id)
+            _trace(
+                "betainvite_intent_blocked",
+                discord_id=interaction.user.id,
+                intent=intent_record.intent,
+            )
+            return
+
+        _trace(
+            "betainvite_intent_ok",
+            discord_id=interaction.user.id,
+            intent=intent_record.intent,
+        )
+        await self._process_invite_request(interaction)
+
+    def _mark_ticket_completed(self, discord_id: int) -> None:
+        try:
+            _set_ticket_status(
+                int(discord_id),
+                BETA_TICKET_STATUS_COMPLETED,
+                closed_at=None,
+            )
+        except Exception:
+            log.debug("Konnte Beta-Invite-Ticket nicht auf completed setzen", exc_info=True)
+
+    async def _start_ticket_entry_flow(self, interaction: discord.Interaction) -> None:
+        self._trace_user_action(interaction, "ticket.entry.start")
+        try:
+            if not interaction.response.is_done():
+                await self._response_defer(interaction, ephemeral=True, thinking=True)
+        except Exception:
+            log.debug("Konnte Ticket-Einstieg nicht deferen", exc_info=True)
+
+        try:
+            ticket_info = await self.start_or_reuse_ticket_for_user(interaction)
+        except Exception:
+            log.exception("Konnte Beta-Invite-Ticket nicht erstellen oder wiederverwenden")
+            if interaction.response.is_done():
+                await self._edit_original_response(
+                    interaction,
+                    content="❌ Diese Interaktion ist fehlgeschlagen. Bitte versuche es erneut.",
+                    view=None,
+                )
+            else:
+                await self._response_send_message(
+                    interaction,
+                    "❌ Diese Interaktion ist fehlgeschlagen. Bitte versuche es erneut.",
+                    ephemeral=True,
+                )
+            return
+
+        if ticket_info is None:
+            if interaction.response.is_done():
+                await self._edit_original_response(
+                    interaction,
+                    content="❌ Diese Interaktion ist fehlgeschlagen. Bitte versuche es erneut.",
+                    view=None,
+                )
+            else:
+                await self._response_send_message(
+                    interaction,
+                    "❌ Diese Interaktion ist fehlgeschlagen. Bitte versuche es erneut.",
+                    ephemeral=True,
+                )
+            return
+
+        ticket_channel, created = ticket_info
+        same_channel = getattr(interaction.channel, "id", None) == ticket_channel.id
+        if created or same_channel:
+            _upsert_ticket_for_user(
+                interaction.user.id,
+                ticket_channel.guild.id,
+                ticket_channel.id,
+                BETA_TICKET_STATUS_OPEN,
+                closed_at=None,
+            )
+            await self._send_ticket_steam_link_step(
+                ticket_channel,
+                interaction.user,
+                interaction=interaction,
+            )
+
+        ack_text = ticket_channel.mention
+        if interaction.response.is_done():
+            await self._edit_original_response(interaction, content=ack_text, view=None)
+        else:
+            await self._response_send_message(interaction, ack_text, ephemeral=True)
 
     async def _run_ui_delivery(
         self,
@@ -1224,14 +1750,15 @@ class BetaInviteFlow(commands.Cog):
         ephemeral: bool = False,
         view: Any | None = None,
     ) -> Any:
-        send_kwargs: dict[str, Any] = {"ephemeral": ephemeral}
+        effective_ephemeral = self._effective_ephemeral(interaction, ephemeral)
+        send_kwargs: dict[str, Any] = {"ephemeral": effective_ephemeral}
         if view is not None:
             send_kwargs["view"] = view
         return await self._run_ui_delivery(
             interaction=interaction,
             call="interaction.response.send_message",
             content=content,
-            ephemeral=ephemeral,
+            ephemeral=effective_ephemeral,
             view=view,
             op=lambda: interaction.response.send_message(content, **send_kwargs),
         )
@@ -1244,14 +1771,15 @@ class BetaInviteFlow(commands.Cog):
         ephemeral: bool = False,
         view: Any | None = None,
     ) -> Any:
-        send_kwargs: dict[str, Any] = {"ephemeral": ephemeral}
+        effective_ephemeral = self._effective_ephemeral(interaction, ephemeral)
+        send_kwargs: dict[str, Any] = {"ephemeral": effective_ephemeral}
         if view is not None:
             send_kwargs["view"] = view
         return await self._run_ui_delivery(
             interaction=interaction,
             call="interaction.followup.send",
             content=content,
-            ephemeral=ephemeral,
+            ephemeral=effective_ephemeral,
             view=view,
             op=lambda: interaction.followup.send(content, **send_kwargs),
         )
@@ -1278,12 +1806,13 @@ class BetaInviteFlow(commands.Cog):
         ephemeral: bool = False,
         thinking: bool = False,
     ) -> Any:
+        effective_ephemeral = self._effective_ephemeral(interaction, ephemeral)
         return await self._run_ui_delivery(
             interaction=interaction,
             call="interaction.response.defer",
             content=f"defer(thinking={thinking})",
-            ephemeral=ephemeral,
-            op=lambda: interaction.response.defer(ephemeral=ephemeral, thinking=thinking),
+            ephemeral=effective_ephemeral,
+            op=lambda: interaction.response.defer(ephemeral=effective_ephemeral, thinking=thinking),
         )
 
     async def _edit_original_response(
@@ -1740,6 +2269,7 @@ class BetaInviteFlow(commands.Cog):
                     view=view,
                     ephemeral=True,
                 )
+            self._mark_ticket_completed(interaction.user.id)
             return
 
         try:
@@ -1769,7 +2299,12 @@ class BetaInviteFlow(commands.Cog):
 
         await self._process_invite_request(interaction)
 
-    def _build_link_prompt_view(self, user: discord.abc.User) -> discord.ui.View:
+    def _build_link_prompt_view(
+        self,
+        user: discord.abc.User,
+        *,
+        next_handler: Callable[[discord.Interaction], Awaitable[None]] | None = None,
+    ) -> discord.ui.View:
         steam_url: str | None = None
         try:
             steam_cog = self.bot.get_cog("SteamLink")
@@ -1783,7 +2318,7 @@ class BetaInviteFlow(commands.Cog):
             except Exception:
                 log.debug("Konnte Steam-Link für BetaInvite nicht bauen", exc_info=True)
 
-        return BetaInviteLinkPromptView(self, user.id, steam_url)
+        return BetaInviteLinkPromptView(self, user.id, steam_url, next_handler=next_handler)
 
     async def _process_invite_request(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "process_invite_request.start")
@@ -1847,6 +2382,7 @@ class BetaInviteFlow(commands.Cog):
                 _build_already_invited_message(existing, resolved),
                 ephemeral=True,
             )
+            self._mark_ticket_completed(interaction.user.id)
             _trace(
                 "betainvite_already_invited",
                 discord_id=interaction.user.id,
@@ -1873,6 +2409,7 @@ class BetaInviteFlow(commands.Cog):
                 _build_already_invited_message(record, resolved),
                 ephemeral=True,
             )
+            self._mark_ticket_completed(interaction.user.id)
             _trace(
                 "betainvite_already_invited_existing",
                 discord_id=interaction.user.id,
@@ -2458,6 +2995,7 @@ class BetaInviteFlow(commands.Cog):
                 else:
                     await self._followup_send(interaction, msg, ephemeral=True)
                 await self._trigger_immediate_role_assignment(record.discord_id)
+                self._mark_ticket_completed(record.discord_id)
                 return True
 
             _failure_log.error("Invite task failed: %s", serialized_details)
@@ -2526,6 +3064,7 @@ class BetaInviteFlow(commands.Cog):
         except Exception:  # pragma: no cover - DM optional
             log.debug("Konnte Bestätigungs-DM nicht senden", exc_info=True)
 
+        self._mark_ticket_completed(record.discord_id)
         return True
 
     async def handle_confirmation(self, interaction: discord.Interaction, record_id: int) -> None:
@@ -2559,6 +3098,7 @@ class BetaInviteFlow(commands.Cog):
                 _build_already_invited_message(record, record.steam_id64),
                 ephemeral=True,
             )
+            self._mark_ticket_completed(record.discord_id)
             return
 
         stop_anim = asyncio.Event()
@@ -2679,7 +3219,7 @@ class BetaInviteFlow(commands.Cog):
         )
 
     async def start_invite_from_panel(self, interaction: discord.Interaction) -> None:
-        await self._start_betainvite_flow(interaction)
+        await self._start_ticket_entry_flow(interaction)
 
     async def _animate_processing(
         self,
@@ -2803,7 +3343,6 @@ class BetaInviteFlow(commands.Cog):
                 prompt = (
                     "Bevor wir fortfahren können, musst du deinen Steam-Account verknüpfen.\n"
                     "Nutze den Steam-Login unten. Sobald du fertig bist, klicke auf **Weiter**.\n"
-                    "Open Source: <https://github.com/NaniDerEchte2/Deadlock-Bots>"
                 )
                 await self._edit_original_response(interaction, content=prompt, view=view)
                 _trace("betainvite_no_link", discord_id=interaction.user.id)
@@ -2850,6 +3389,7 @@ class BetaInviteFlow(commands.Cog):
                     content=_make_payment_message(payment_token),
                     view=view,
                 )
+                self._mark_ticket_completed(interaction.user.id)
                 _trace(
                     "betainvite_intent_blocked",
                     discord_id=interaction.user.id,
@@ -2873,7 +3413,7 @@ class BetaInviteFlow(commands.Cog):
     )
     async def betainvite(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "command.betainvite")
-        await self._start_betainvite_flow(interaction)
+        await self._start_ticket_entry_flow(interaction)
 
     @app_commands.command(
         name="publish_betainvite_panel",
