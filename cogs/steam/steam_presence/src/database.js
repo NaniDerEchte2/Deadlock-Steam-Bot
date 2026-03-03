@@ -446,13 +446,13 @@ module.exports = (ctx) => {
     SELECT steam_id, requested_at, attempts, last_attempt
       FROM steam_friend_requests
      WHERE steam_id=?
-       AND status='pending'
+       AND status IN ('pending', 'manual')
      LIMIT 1
   `);
   const selectFriendRequestBatchStmt = db.prepare(`
     SELECT steam_id, status, attempts, last_attempt
       FROM steam_friend_requests
-     WHERE status != 'sent'
+     WHERE status = 'pending'
   ORDER BY COALESCE(last_attempt, 0) ASC
      LIMIT ?
   `);
