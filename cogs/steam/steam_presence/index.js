@@ -288,10 +288,10 @@ const {
   upsertStandaloneStateStmt, steamTaskCountsStmt, steamTaskRecentStmt,
   steamLinksForSyncStmt,
   selectFriendCheckCacheStmt, upsertFriendCheckCacheStmt, countFriendRequestsSentSinceStmt,
-  upsertPendingFriendRequestStmt, selectFriendRequestBatchStmt,
+  upsertPendingFriendRequestStmt, selectPendingFriendRequestForSteamIdStmt, selectFriendRequestBatchStmt,
   markFriendRequestSentStmt, markFriendRequestSkippedStmt, markFriendRequestFailedStmt,
   deleteFriendRequestStmt, clearFriendFlagStmt,
-  verifySteamLinkStmt, unverifySteamLinkStmt,
+  selectSteamLinkOwnersForSteamIdStmt, verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
 } = database;
 installSteamTaskCapTrigger();
 pruneSteamTasks('startup');
@@ -304,6 +304,7 @@ const state = {
   },
   runtimeState: {
     account_name: ACCOUNT_NAME || null,
+    account_password_configured: Boolean(ACCOUNT_PASSWORD),
     logged_on: false,
     logging_in: false,
     steam_id64: null,
@@ -424,10 +425,10 @@ const sharedCtx = {
   upsertStandaloneStateStmt, steamTaskCountsStmt, steamTaskRecentStmt,
   steamLinksForSyncStmt,
   selectFriendCheckCacheStmt, upsertFriendCheckCacheStmt, countFriendRequestsSentSinceStmt,
-  upsertPendingFriendRequestStmt, selectFriendRequestBatchStmt,
+  upsertPendingFriendRequestStmt, selectPendingFriendRequestForSteamIdStmt, selectFriendRequestBatchStmt,
   markFriendRequestSentStmt, markFriendRequestSkippedStmt, markFriendRequestFailedStmt,
   deleteFriendRequestStmt, clearFriendFlagStmt,
-  verifySteamLinkStmt, unverifySteamLinkStmt,
+  selectSteamLinkOwnersForSteamIdStmt, verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
 };
 
 // 1. State — provides scheduleStatePublish (late-bound into sharedCtx for other modules)
@@ -539,7 +540,7 @@ require('./src/events')({
   REFRESH_TOKEN_PATH, MACHINE_TOKEN_PATH, STEAM_VAULT_REFRESH_TOKEN, STEAM_VAULT_MACHINE_TOKEN, STEAM_TOKEN_VAULT_ENABLED,
   writeToken, writeDeadlockGcTrace, requestDeadlockGcTokens, getDeadlockGcTokenCount,
   GC_MSG_FIND_HERO_BUILDS_RESPONSE,
-  unverifySteamLinkStmt,
+  selectPendingFriendRequestForSteamIdStmt,
   nowSeconds,
 });
 

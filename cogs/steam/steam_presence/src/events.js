@@ -136,104 +136,107 @@ client.on('appQuit', (appId) => {
 
 // Track friend relationship changes to auto-save steam links to DB
 client.on('friendRelationship', (steamId, relationship) => {
-  const sid64 = steamId && typeof steamId.getSteamID64 === 'function' ? steamId.getSteamID64() : String(steamId);
+  const sid64Raw = steamId && typeof steamId.getSteamID64 === 'function' ? steamId.getSteamID64() : String(steamId || '');
+  const sid64 = normalizeSteamId64(sid64Raw);
   const relName = relationshipName(relationship);
+  const EFriendRelationship = SteamUser.EFriendRelationship || {};
 
   log('info', 'Friend relationship changed', {
-    steam_id64: sid64,
+    steam_id64: sid64 || sid64Raw || null,
     relationship: relationship,
     relationship_name: relName,
   });
 
-    // If we became friends, save to database
+  if (sid64 && typeof setFriendCheckCacheStatus === 'function') {
+    const isFriend = Number(relationship) === Number(EFriendRelationship.Friend);
+    setFriendCheckCacheStatus(sid64, isFriend, 'friendRelationship_event');
+  }
 
-    const EFriendRelationship = SteamUser.EFriendRelationship || {};
-
-    if (Number(relationship) === Number(EFriendRelationship.RequestRecipient)) {
-      log('info', 'Accepting incoming friend request', { steam_id64: sid64 });
-      try {
-        client.addFriend(steamId, (err) => {
-          if (err) log('warn', 'Failed to accept incoming friend request', { steam_id64: sid64, error: err.message });
-          else log('info', 'Successfully accepted friend request', { steam_id64: sid64 });
-        });
-      } catch (err) {
-        log('error', 'Error in addFriend for incoming request', { steam_id64: sid64, error: err.message });
-      }
-    } else if (Number(relationship) === Number(EFriendRelationship.Friend)) {
-
-      log('info', 'New friend confirmed, checking steam_links', { steam_id64: sid64 });
-
-  
-
-      const cachedName = resolveCachedPersonaName(sid64);
-
-      if (verifySteamLink(sid64, cachedName)) {
-
-        log('info', 'Verified existing steam_link', {
-
-          steam_id64: sid64,
-
-          name: cachedName || undefined,
-
-        });
-
-      }
-
-  
-
-      // Fetch name asynchronously if it was not available in cache yet
-
-      if (!cachedName) {
-
-        fetchPersonaNames([sid64]).then((map) => {
-
-          const normalized = normalizeSteamId64(sid64);
-
-          const fetchedName = normalized ? map.get(normalized) : null;
-
-          if (fetchedName) verifySteamLink(sid64, fetchedName);
-
-        }).catch((err) => {
-
-          log('debug', 'Failed to fetch persona for new friend', {
-
-            steam_id64: sid64,
-
-            error: err && err.message ? err.message : String(err),
-
-          });
-
-        });
-
-      }
-
-      // Direkt nach neuer Freundschaft: PlayerCard nur für diesen Account laden (Rate-Limit: 10 Min)
-      requestProfileCardForSid(sid64);
-
-    } else if (Number(relationship) === Number(EFriendRelationship.None)) {
-
-      // Unfriended -> Unverify
-
-      log('info', 'Friendship ended, unverifying in steam_links', { steam_id64: sid64 });
-
-      try {
-
-          const info = unverifySteamLinkStmt.run(sid64);
-
-          if (info.changes > 0) {
-
-              log('info', 'Unverified steam link', { steam_id64: sid64, changes: info.changes });
-
-          }
-
-      } catch (err) {
-
-          log('error', 'Failed to unverify steam link', { steam_id64: sid64, error: err.message });
-
-      }
-
+  if (Number(relationship) === Number(EFriendRelationship.RequestRecipient)) {
+    if (!sid64) {
+      log('warn', 'Ignoring incoming friend request with invalid SteamID', { steam_id64: sid64Raw || null });
+      return;
+    }
+    if (!selectPendingFriendRequestForSteamIdStmt || typeof selectPendingFriendRequestForSteamIdStmt.get !== 'function') {
+      log('warn', 'Incoming friend request whitelist check unavailable - refusing auto-accept', { steam_id64: sid64 });
+      return;
     }
 
+    let pendingRequest = null;
+    try {
+      pendingRequest = selectPendingFriendRequestForSteamIdStmt.get(sid64);
+    } catch (err) {
+      log('warn', 'Failed to verify incoming friend request against DB', {
+        steam_id64: sid64,
+        error: err && err.message ? err.message : String(err),
+      });
+      return;
+    }
+    if (!pendingRequest) {
+      log('warn', 'Ignoring unsolicited incoming friend request', { steam_id64: sid64 });
+      return;
+    }
+
+    log('info', 'Accepting incoming friend request (matched pending queue row)', {
+      steam_id64: sid64,
+      requested_at: pendingRequest.requested_at || null,
+      attempts: pendingRequest.attempts || 0,
+    });
+    try {
+      client.addFriend(steamId, (err) => {
+        if (err) {
+          log('warn', 'Failed to accept incoming friend request', {
+            steam_id64: sid64,
+            error: err && err.message ? err.message : String(err),
+          });
+        } else {
+          log('info', 'Successfully accepted friend request', { steam_id64: sid64 });
+        }
+      });
+    } catch (err) {
+      log('error', 'Error in addFriend for incoming request', {
+        steam_id64: sid64,
+        error: err && err.message ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (Number(relationship) === Number(EFriendRelationship.Friend)) {
+    log('info', 'New friend confirmed, checking steam_links', { steam_id64: sid64 || sid64Raw });
+
+    const cachedName = resolveCachedPersonaName(sid64);
+    if (verifySteamLink(sid64, cachedName)) {
+      log('info', 'Verified existing steam_link', {
+        steam_id64: sid64,
+        name: cachedName || undefined,
+      });
+    }
+
+    if (!cachedName) {
+      fetchPersonaNames([sid64]).then((map) => {
+        const normalized = normalizeSteamId64(sid64);
+        const fetchedName = normalized ? map.get(normalized) : null;
+        if (fetchedName) verifySteamLink(sid64, fetchedName);
+      }).catch((err) => {
+        log('debug', 'Failed to fetch persona for new friend', {
+          steam_id64: sid64,
+          error: err && err.message ? err.message : String(err),
+        });
+      });
+    }
+
+    // Direkt nach neuer Freundschaft: PlayerCard nur für diesen Account laden (Rate-Limit: 10 Min)
+    requestProfileCardForSid(sid64);
+    return;
+  }
+
+  if (Number(relationship) === Number(EFriendRelationship.None)) {
+    log('info', 'Friendship ended, unverifying in steam_links', { steam_id64: sid64 || sid64Raw });
+    if (unverifySteamLink(sid64 || sid64Raw)) {
+      log('info', 'Unverified steam link', { steam_id64: sid64 || sid64Raw });
+    }
+  }
   });
 
 client.on('receivedFromGC', (appId, msgType, payload) => {

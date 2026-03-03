@@ -13,26 +13,60 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from discord.ext import commands, tasks
 
 from cogs.steam.token_vault import (
     get_refresh_token_age_days,
+    refresh_token_path as token_vault_refresh_token_path,
     refresh_token_exists,
-    write_refresh_token,
 )
 from service import db
 
 log = logging.getLogger(__name__)
+_STEAM_ACCOUNT_ENV_NAMES = ("STEAM_BOT_USERNAME", "STEAM_LOGIN", "STEAM_ACCOUNT")
+_STEAM_PASSWORD_ENV_NAMES = ("STEAM_BOT_PASSWORD", "STEAM_PASSWORD")
+_SENSITIVE_GUARD_TASK_TIMEOUT_S = 120
 
 
-def _refresh_token_path() -> Path:
-    configured = (os.getenv("STEAM_PRESENCE_DATA_DIR") or "").strip()
-    if configured:
-        return Path(configured).expanduser() / "refresh.token"
-    return Path(__file__).parent / "steam_presence" / ".steam-data" / "refresh.token"
+def _refresh_token_path():
+    return token_vault_refresh_token_path()
+
+
+def _first_configured_env(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _load_steam_runtime_state() -> dict[str, object]:
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT payload FROM standalone_bot_state WHERE bot = 'steam' LIMIT 1"
+            ).fetchone()
+    except Exception:
+        log.debug("Failed to read Steam runtime state for refresh preflight", exc_info=True)
+        return {}
+
+    if not row:
+        return {}
+
+    try:
+        payload = json.loads(row[0])
+    except Exception:
+        log.debug("Failed to decode Steam runtime state for refresh preflight", exc_info=True)
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    runtime = payload.get("runtime")
+    return runtime if isinstance(runtime, dict) else {}
 
 
 class SteamGuardAutoConfig:
@@ -166,7 +200,7 @@ class SteamGuardEmailMonitor:
 
             # Extract text content
             body_text = self._extract_email_body(email_message)
-            log.debug(f"Email body excerpt: {body_text[:200]}")
+            log.debug("Fetched Steam Guard email body", extra={"length": len(body_text)})
 
             # Search for Steam Guard code
             match = self.CODE_PATTERN.search(body_text)
@@ -189,7 +223,7 @@ class SteamGuardEmailMonitor:
                         break
 
             if code:
-                log.info(f"✅ Found Steam Guard code: {code}")
+                log.info("✅ Found Steam Guard code in email")
                 self._last_processed_uid = latest_id
                 mail.logout()
                 return code
@@ -260,23 +294,93 @@ class SteamGuardAuto(commands.Cog):
         """Get age of current refresh token in days."""
         return get_refresh_token_age_days(_refresh_token_path())
 
+    def _expire_stale_guard_code_tasks(self) -> int:
+        """Fail closed on orphaned AUTH_GUARD_CODE tasks that still carry a payload."""
+        now = int(time.time())
+        cutoff = now - _SENSITIVE_GUARD_TASK_TIMEOUT_S
+        stale_error = (
+            "Task stale: sensitiver Guard-Code nach "
+            f"{_SENSITIVE_GUARD_TASK_TIMEOUT_S}s verworfen"
+        )
+
+        try:
+            with db.get_conn() as conn:
+                before = conn.total_changes
+                conn.execute(
+                    """
+                    UPDATE steam_tasks
+                       SET status = 'FAILED',
+                           payload = NULL,
+                           error = CASE
+                               WHEN error IS NULL OR error = '' THEN ?
+                               ELSE error
+                           END,
+                           finished_at = ?,
+                           updated_at = ?
+                     WHERE type = 'AUTH_GUARD_CODE'
+                       AND status = 'PENDING'
+                       AND payload IS NOT NULL
+                       AND updated_at < ?
+                    """,
+                    (stale_error, now, now, cutoff),
+                )
+                conn.commit()
+                return int(conn.total_changes - before)
+        except Exception:
+            log.debug("Failed to expire stale AUTH_GUARD_CODE tasks", exc_info=True)
+            return 0
+
+    def _credential_login_preflight(self) -> tuple[bool, str | None]:
+        """Verify that a forced credential login can run before disrupting the session."""
+        runtime = _load_steam_runtime_state()
+        worker_account = str(runtime.get("account_name") or "").strip()
+        worker_password_ready = bool(runtime.get("account_password_configured"))
+        if runtime:
+            if not worker_account:
+                return (
+                    False,
+                    "standalone_bot_state/runtime.account_name is empty; worker credentials are "
+                    "not ready for force_credentials login",
+                )
+            if not worker_password_ready:
+                return (
+                    False,
+                    "standalone_bot_state/runtime.account_password_configured is false; "
+                    "worker password is not ready for force_credentials login",
+                )
+            return True, None
+
+        local_account = _first_configured_env(_STEAM_ACCOUNT_ENV_NAMES)
+        if not local_account:
+            return (
+                False,
+                "missing Steam account name in standalone_bot_state/runtime.account_name "
+                "and local env",
+            )
+
+        password = _first_configured_env(_STEAM_PASSWORD_ENV_NAMES)
+        if not password:
+            return (
+                False,
+                "missing credential password in local env "
+                "(STEAM_BOT_PASSWORD or STEAM_PASSWORD)",
+            )
+
+        return True, None
+
     async def _trigger_token_refresh(self):
         """Trigger a token refresh by re-authenticating."""
         log.info("🔄 Starting scheduled Steam token refresh...")
         self._refresh_in_progress = True
 
         try:
-            # Get Steam account credentials from environment
-            steam_account = os.getenv("STEAM_BOT_USERNAME") or os.getenv("STEAM_LOGIN")
-            steam_password = os.getenv("STEAM_BOT_PASSWORD") or os.getenv("STEAM_PASSWORD")
-
-            if not steam_account or not steam_password:
-                log.error("Cannot refresh token: STEAM_BOT_USERNAME/PASSWORD not set")
-                self._refresh_in_progress = False
+            preflight_ok, preflight_error = self._credential_login_preflight()
+            if not preflight_ok:
+                log.error(
+                    "Aborting scheduled Steam token refresh before logout: %s",
+                    preflight_error,
+                )
                 return
-
-            # Clear old token
-            import json
 
             with db.get_conn() as conn:
                 task_id = conn.execute(
@@ -288,21 +392,14 @@ class SteamGuardAuto(commands.Cog):
             log.info(f"Enqueued AUTH_LOGOUT task #{task_id}")
             await asyncio.sleep(3)
 
-            # Delete previous token from vault/file storage.
             token_path = _refresh_token_path()
-            write_refresh_token("", token_path)
-            log.info("Cleared previous refresh token from storage")
+            log.info("Keeping existing refresh token in storage until a replacement is confirmed")
 
             # Start new login (this will trigger Steam Guard email)
             with db.get_conn() as conn:
-                payload = {
-                    "force_credentials": True,
-                    "account_name": steam_account,
-                    "password": steam_password,
-                }
                 task_id = conn.execute(
                     "INSERT INTO steam_tasks(type, payload, status) VALUES(?, ?, 'PENDING')",
-                    ("AUTH_LOGIN", json.dumps(payload)),
+                    ("AUTH_LOGIN", json.dumps({"force_credentials": True})),
                 ).lastrowid
                 conn.commit()
 
@@ -387,6 +484,16 @@ class SteamGuardAuto(commands.Cog):
         to auto-submit code from email.
         """
         try:
+            expired = self._expire_stale_guard_code_tasks()
+            if expired > 0:
+                log.warning(
+                    "Expired stale AUTH_GUARD_CODE tasks before polling",
+                    extra={
+                        "count": expired,
+                        "max_age_seconds": _SENSITIVE_GUARD_TASK_TIMEOUT_S,
+                    },
+                )
+
             # Skip completely if Steam is already logged in – avoid needless polling
             with db.get_conn() as conn:
                 row_state = conn.execute(
@@ -447,7 +554,7 @@ class SteamGuardAuto(commands.Cog):
                 return
 
             # Submit code via Steam task
-            log.info(f"📧 Auto-submitting Steam Guard code: {code}")
+            log.info("📧 Auto-submitting Steam Guard code from email")
 
             with db.get_conn() as task_conn:
                 cursor = task_conn.execute(

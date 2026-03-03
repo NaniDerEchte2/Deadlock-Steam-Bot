@@ -14,7 +14,9 @@ const { URL } = require('url');
  *            selectFriendRequestBatchStmt, markFriendRequestSentStmt,
  *            markFriendRequestFailedStmt, markFriendRequestSkippedStmt,
  *            deleteFriendRequestStmt, clearFriendFlagStmt,
- *            verifySteamLinkStmt, countFriendRequestsSentSinceStmt }
+ *            selectSteamLinkOwnersForSteamIdStmt,
+ *            verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+ *            countFriendRequestsSentSinceStmt }
  */
 module.exports = (ctx) => {
   const {
@@ -27,11 +29,15 @@ module.exports = (ctx) => {
     selectFriendRequestBatchStmt, markFriendRequestSentStmt,
     markFriendRequestFailedStmt, markFriendRequestSkippedStmt,
     deleteFriendRequestStmt, clearFriendFlagStmt,
-    verifySteamLinkStmt, countFriendRequestsSentSinceStmt,
+    selectSteamLinkOwnersForSteamIdStmt,
+    verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+    countFriendRequestsSentSinceStmt,
   } = ctx;
 
   const FRIEND_REQUEST_DAILY_WINDOW_SEC = 24 * 60 * 60;
-  const FRIEND_CHECK_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const FRIEND_CHECK_CACHE_POSITIVE_TTL_MS = 24 * 60 * 60 * 1000;
+  const FRIEND_CHECK_CACHE_NEGATIVE_TTL_MS = 2 * 60 * 1000;
+  const FRIEND_REQUEST_ERROR_WARN_LIMIT_PER_BATCH = 5;
 
   // ---------- Utils ----------
   function normalizeSteamId64(value) {
@@ -162,21 +168,51 @@ module.exports = (ctx) => {
     return { friend: false, source: 'webapi', refreshed: true };
   }
 
+  function getFriendCheckTtlMs(isFriend) {
+    return isFriend ? FRIEND_CHECK_CACHE_POSITIVE_TTL_MS : FRIEND_CHECK_CACHE_NEGATIVE_TTL_MS;
+  }
+
+  function setFriendCheckCacheStatus(steamId64, isFriend, source = 'unknown') {
+    const sid = normalizeSteamId64(steamId64);
+    if (!sid) return false;
+    const nowMs = Date.now();
+    const friend = Boolean(isFriend);
+    state.friendCheckCache.set(sid, { friend, ts: nowMs });
+    try {
+      upsertFriendCheckCacheStmt.run(sid, friend ? 1 : 0, Math.floor(nowMs / 1000));
+    } catch (err) {
+      log('debug', 'Failed to persist friend-check cache status', {
+        steam_id64: sid,
+        friend,
+        source,
+        error: err && err.message ? err.message : String(err),
+      });
+    }
+    return friend;
+  }
+
   async function isAlreadyFriend(steamId64) {
     const sid = normalizeSteamId64(steamId64);
     if (!sid) return false;
 
     const nowMs = Date.now();
     const cached = state.friendCheckCache.get(sid);
-    if (cached && nowMs - cached.ts < FRIEND_CHECK_CACHE_TTL_MS) return cached.friend;
+    if (cached) {
+      const ttlMs = getFriendCheckTtlMs(Boolean(cached.friend));
+      if (nowMs - cached.ts < ttlMs) return Boolean(cached.friend);
+      state.friendCheckCache.delete(sid);
+    }
 
     try {
       const row = selectFriendCheckCacheStmt.get(sid);
       if (row && Number.isFinite(row.checked_at)) {
+        const isFriend = Boolean(row.friend);
         const ageMs = nowMs - Number(row.checked_at) * 1000;
-        if (ageMs < FRIEND_CHECK_CACHE_TTL_MS) {
-          const isFriend = Boolean(row.friend);
-          state.friendCheckCache.set(sid, { friend: isFriend, ts: nowMs });
+        if (ageMs < getFriendCheckTtlMs(isFriend)) {
+          state.friendCheckCache.set(sid, {
+            friend: isFriend,
+            ts: Number(row.checked_at) * 1000,
+          });
           return isFriend;
         }
       }
@@ -188,26 +224,20 @@ module.exports = (ctx) => {
     const friendCode = Number(relMap.Friend);
 
     if (client && client.myFriends) {
-      const rel = client.myFriends[sid];
-      if (Number(rel) === friendCode) {
-        state.friendCheckCache.set(sid, { friend: true, ts: nowMs });
-        try { upsertFriendCheckCacheStmt.run(sid, 1, Math.floor(nowMs / 1000)); } catch (_) {}
-        return true;
+      const hasRel = Object.prototype.hasOwnProperty.call(client.myFriends, sid);
+      if (hasRel) {
+        return setFriendCheckCacheStatus(sid, Number(client.myFriends[sid]) === friendCode, 'client');
       }
     }
 
     try {
       const viaWeb = await isFriendViaWebApi(sid);
       if (viaWeb && viaWeb.friend) {
-        state.friendCheckCache.set(sid, { friend: true, ts: nowMs });
-        try { upsertFriendCheckCacheStmt.run(sid, 1, Math.floor(nowMs / 1000)); } catch (_) {}
-        return true;
+        return setFriendCheckCacheStatus(sid, true, viaWeb.source || 'webapi');
       }
     } catch (_) {}
 
-    state.friendCheckCache.set(sid, { friend: false, ts: nowMs });
-    try { upsertFriendCheckCacheStmt.run(sid, 0, Math.floor(nowMs / 1000)); } catch (_) {}
-    return false;
+    return setFriendCheckCacheStatus(sid, false, 'miss');
   }
 
   function getWebApiFriendCacheAgeMs() {
@@ -280,15 +310,83 @@ module.exports = (ctx) => {
     };
   }
 
-  function verifySteamLink(steamId64, displayName) {
+  function resolveUniqueOwnerUserId(steamId64, action) {
     const sid = normalizeSteamId64(steamId64);
-    if (!sid) return false;
+    if (!sid) return { steamId: null, ownerUserId: null };
+    let ownerRows = [];
+    try {
+      ownerRows = selectSteamLinkOwnersForSteamIdStmt.all(sid);
+    } catch (err) {
+      log('warn', 'Failed to query steam_link owners before ownership-scoped update', {
+        steam_id64: sid,
+        action,
+        error: err && err.message ? err.message : String(err),
+      });
+      return { steamId: sid, ownerUserId: null };
+    }
+    if (!Array.isArray(ownerRows) || ownerRows.length === 0) {
+      log('debug', 'Skipping ownership-scoped update without user-owned steam_link row', {
+        steam_id64: sid,
+        action,
+      });
+      return { steamId: sid, ownerUserId: null };
+    }
+    if (ownerRows.length > 1) {
+      log('warn', 'Blocked ownership-scoped update due to duplicate steam_id ownership', {
+        steam_id64: sid,
+        action,
+        owner_user_ids: ownerRows.map((row) => row.user_id),
+      });
+      return { steamId: sid, ownerUserId: null };
+    }
+    const ownerUserId = Number(ownerRows[0].user_id);
+    if (!Number.isFinite(ownerUserId) || ownerUserId <= 0) {
+      log('warn', 'Skipping ownership-scoped update due to invalid owner user_id', {
+        steam_id64: sid,
+        action,
+        owner_user_id: ownerRows[0].user_id,
+      });
+      return { steamId: sid, ownerUserId: null };
+    }
+    return { steamId: sid, ownerUserId };
+  }
+
+  function verifySteamLink(steamId64, displayName) {
+    const owner = resolveUniqueOwnerUserId(steamId64, 'verify');
+    if (!owner.steamId || !owner.ownerUserId) return false;
     const name = displayName ? String(displayName).trim() : '';
     try {
-      const info = verifySteamLinkStmt.run({ steam_id: sid, name });
+      const info = verifySteamLinkForUserStmt.run({
+        steam_id: owner.steamId,
+        user_id: owner.ownerUserId,
+        name,
+      });
       return info.changes > 0;
     } catch (err) {
-      log('warn', 'Failed to verify steam link', { steam_id64: sid, error: err && err.message ? err.message : String(err) });
+      log('warn', 'Failed to verify steam link', {
+        steam_id64: owner.steamId,
+        owner_user_id: owner.ownerUserId,
+        error: err && err.message ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  function unverifySteamLink(steamId64) {
+    const owner = resolveUniqueOwnerUserId(steamId64, 'unverify');
+    if (!owner.steamId || !owner.ownerUserId) return false;
+    try {
+      const info = unverifySteamLinkForUserStmt.run({
+        steam_id: owner.steamId,
+        user_id: owner.ownerUserId,
+      });
+      return info.changes > 0;
+    } catch (err) {
+      log('warn', 'Failed to unverify steam link', {
+        steam_id64: owner.steamId,
+        owner_user_id: owner.ownerUserId,
+        error: err && err.message ? err.message : String(err),
+      });
       return false;
     }
   }
@@ -412,6 +510,8 @@ module.exports = (ctx) => {
 
     const rows = selectFriendRequestBatchStmt.all(FRIEND_REQUEST_BATCH_SIZE);
     const now = nowSeconds();
+    let warnedFailures = 0;
+    let suppressedFailureLogs = 0;
     let sentLast24h = 0;
     try {
       const row = countFriendRequestsSentSinceStmt.get(now - FRIEND_REQUEST_DAILY_WINDOW_SEC);
@@ -464,8 +564,22 @@ module.exports = (ctx) => {
         const message = err && err.message ? err.message : String(err);
         markFriendRequestFailedStmt.run(now, message, sid);
         outcome.failed += 1;
-        log('warn', 'Friend request failed', { steam_id64: sid, error: message, reason });
+        if (warnedFailures < FRIEND_REQUEST_ERROR_WARN_LIMIT_PER_BATCH) {
+          warnedFailures += 1;
+          log('warn', 'Friend request failed', { steam_id64: sid, error: message, reason });
+        } else {
+          suppressedFailureLogs += 1;
+        }
       }
+    }
+
+    if (suppressedFailureLogs > 0) {
+      log('warn', 'Friend request failures suppressed for batch', {
+        suppressed: suppressedFailureLogs,
+        warn_limit: FRIEND_REQUEST_ERROR_WARN_LIMIT_PER_BATCH,
+        failed_total: outcome.failed,
+        reason,
+      });
     }
 
     return outcome;
@@ -544,10 +658,12 @@ module.exports = (ctx) => {
     loadWebApiFriendIds,
     isFriendViaWebApi,
     isAlreadyFriend,
+    setFriendCheckCacheStatus,
     getWebApiFriendCacheAgeMs,
     sendFriendRequest,
     removeFriendship,
     verifySteamLink,
+    unverifySteamLink,
     requestProfileCardForSid,
     queueFriendRequestForId,
     collectKnownFriendIds,

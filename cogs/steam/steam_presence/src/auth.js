@@ -10,6 +10,9 @@ module.exports = (ctx) => {
   const {
     state, runtimeState, client, log, nowSeconds,
     ACCOUNT_NAME, ACCOUNT_PASSWORD,
+    readToken,
+    REFRESH_TOKEN_PATH, MACHINE_TOKEN_PATH,
+    STEAM_VAULT_REFRESH_TOKEN, STEAM_VAULT_MACHINE_TOKEN,
     clearReconnectTimer,
   } = ctx;
 
@@ -25,6 +28,41 @@ module.exports = (ctx) => {
     scheduleStatePublish({ reason: 'machine_token' });
   }
 
+  function loadStoredRefreshToken() {
+    if (typeof readToken !== 'function') return state.tokens.refreshToken || '';
+    const token = readToken(REFRESH_TOKEN_PATH, STEAM_VAULT_REFRESH_TOKEN);
+    state.tokens.refreshToken = token ? String(token).trim() : '';
+    runtimeState.refresh_token_present = Boolean(state.tokens.refreshToken);
+    return state.tokens.refreshToken;
+  }
+
+  function loadStoredMachineToken() {
+    if (typeof readToken !== 'function') return state.tokens.machineAuthToken || '';
+    const token = readToken(MACHINE_TOKEN_PATH, STEAM_VAULT_MACHINE_TOKEN);
+    state.tokens.machineAuthToken = token ? String(token).trim() : '';
+    runtimeState.machine_token_present = Boolean(state.tokens.machineAuthToken);
+    return state.tokens.machineAuthToken;
+  }
+
+  function assertNoSensitivePayloadOverrides(payload) {
+    if (!payload || typeof payload !== 'object') return;
+
+    const blockedFields = ['account_name', 'password', 'refresh_token', 'machine_auth_token', 'two_factor_code', 'auth_code']
+      .filter((field) => (
+        Object.prototype.hasOwnProperty.call(payload, field)
+        && payload[field] !== null
+        && payload[field] !== undefined
+        && String(payload[field]).trim()
+      ));
+
+    if (blockedFields.length > 0) {
+      throw new Error(
+        `Blocked sensitive AUTH_LOGIN payload fields: ${blockedFields.join(', ')}. `
+        + 'Use Node worker credentials and the token vault instead.'
+      );
+    }
+  }
+
   function guardTypeFromDomain(domain) {
     const norm = String(domain || '').toLowerCase();
     if (norm.includes('email') || norm.includes('@')) return 'email';
@@ -36,7 +74,8 @@ module.exports = (ctx) => {
 
   function buildLoginOptions(overrides = {}) {
     if (overrides.refreshToken) return { refreshToken: overrides.refreshToken };
-    if (state.tokens.refreshToken && !overrides.forceAccountCredentials) return { refreshToken: state.tokens.refreshToken };
+    const storedRefreshToken = !overrides.forceAccountCredentials ? loadStoredRefreshToken() : '';
+    if (storedRefreshToken && !overrides.forceAccountCredentials) return { refreshToken: storedRefreshToken };
     const accountName = overrides.accountName ?? ACCOUNT_NAME;
     const password = overrides.password ?? ACCOUNT_PASSWORD;
 
@@ -48,7 +87,10 @@ module.exports = (ctx) => {
     if (overrides.authCode) options.authCode = String(overrides.authCode);
     if (Object.prototype.hasOwnProperty.call(overrides, 'rememberPassword')) options.rememberPassword = Boolean(overrides.rememberPassword);
     if (overrides.machineAuthToken) options.machineAuthToken = String(overrides.machineAuthToken);
-    else if (state.tokens.machineAuthToken) options.machineAuthToken = state.tokens.machineAuthToken;
+    else {
+      const storedMachineToken = loadStoredMachineToken();
+      if (storedMachineToken) options.machineAuthToken = storedMachineToken;
+    }
     return options;
   }
 
@@ -61,15 +103,12 @@ module.exports = (ctx) => {
 
     const overrides = {};
     if (payload) {
+      assertNoSensitivePayloadOverrides(payload);
       if (Object.prototype.hasOwnProperty.call(payload, 'use_refresh_token') && !payload.use_refresh_token) overrides.forceAccountCredentials = true;
       if (Object.prototype.hasOwnProperty.call(payload, 'force_credentials') && payload.force_credentials) overrides.forceAccountCredentials = true;
-      if (payload.account_name) overrides.accountName = payload.account_name;
-      if (payload.password) overrides.password = payload.password;
-      if (payload.refresh_token) overrides.refreshToken = payload.refresh_token;
       if (payload.two_factor_code) overrides.twoFactorCode = payload.two_factor_code;
       if (payload.auth_code) overrides.authCode = payload.auth_code;
       if (Object.prototype.hasOwnProperty.call(payload, 'remember_password')) overrides.rememberPassword = Boolean(payload.remember_password);
-      if (payload.machine_auth_token) overrides.machineAuthToken = payload.machine_auth_token;
     }
 
     const options = buildLoginOptions(overrides);

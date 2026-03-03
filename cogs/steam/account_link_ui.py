@@ -52,9 +52,12 @@ def make_link_embed(
         "**Open Source:**",
         "Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>",
         "",
-        "**So geht's:**",
-        "Klick auf den Steam-Button unten. Danach **musst du dem Steam-Bot eine Freundschaftsanfrage senden** "
-        "Freundescode **820142646**, sonst wird die Verknüpfung nicht aktiv.",
+        "**So geht's (2 Optionen):**",
+        "1. **Option 1 (OpenID):** Unten auf den Steam-Button klicken und bei Steam anmelden.",
+        "2. **Option 2 (Freundescode):** In Steam `Freund hinzufügen` öffnen, Freundescode "
+        "**820142646** eingeben und Anfrage senden.",
+        "",
+        "Die Verknüpfung ist erst vollständig aktiv, wenn beide Optionen erledigt sind.",
     ]
 
     return discord.Embed(
@@ -83,7 +86,7 @@ def make_link_view(user_id: int, *, timeout: float | None = 3600) -> discord.ui.
     if steam_url:
         view.add_item(
             discord.ui.Button(
-                label="Direkt bei Steam anmelden",
+                label="Option 1: Bei Steam anmelden",
                 style=discord.ButtonStyle.link,
                 url=steam_url,
                 emoji="🎮",
@@ -140,11 +143,6 @@ async def send_link_panel(
 
 def _get_steam_url(user_id: int) -> str:
     """Gibt die Steam-Login-URL zurück. Leerer String bei Fehler."""
-    from service.config import settings
+    from cogs.steam.steam_link_oauth import build_steam_login_start_url
 
-    base = settings.public_base_url.rstrip("/")
-    if not base:
-        return ""
-
-    uid = int(user_id)
-    return f"{base}/steam/login?uid={uid}"
+    return build_steam_login_start_url(int(user_id))

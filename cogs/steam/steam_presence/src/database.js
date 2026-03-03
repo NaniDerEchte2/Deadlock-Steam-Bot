@@ -87,6 +87,67 @@ module.exports = (ctx) => {
   }
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_steam_links_user ON steam_links(user_id)`).run();
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_steam_links_steam ON steam_links(steam_id)`).run();
+  function ensureSteamLinkOwnershipGuardrails() {
+    try {
+      db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_steam_links_steam_owner
+        ON steam_links(steam_id)
+        WHERE user_id != 0
+      `).run();
+    } catch (err) {
+      log('warn', 'Failed to ensure unique steam_id ownership index (dirty historical data or SQLite limitation)', {
+        error: err && err.message ? err.message : String(err),
+      });
+    }
+
+    const guardStatements = [
+      `DROP TRIGGER IF EXISTS trg_steam_links_owner_guard_insert`,
+      `DROP TRIGGER IF EXISTS trg_steam_links_owner_guard_update`,
+      `
+        CREATE TRIGGER trg_steam_links_owner_guard_insert
+        BEFORE INSERT ON steam_links
+        FOR EACH ROW
+        WHEN NEW.user_id != 0
+          AND EXISTS (
+            SELECT 1
+              FROM steam_links
+             WHERE steam_id = NEW.steam_id
+               AND user_id NOT IN (NEW.user_id, 0)
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'steam_links ownership conflict');
+        END
+      `,
+      `
+        CREATE TRIGGER trg_steam_links_owner_guard_update
+        BEFORE UPDATE OF user_id, steam_id ON steam_links
+        FOR EACH ROW
+        WHEN NEW.user_id != 0
+          AND (NEW.user_id != OLD.user_id OR NEW.steam_id != OLD.steam_id)
+          AND EXISTS (
+            SELECT 1
+              FROM steam_links
+             WHERE steam_id = NEW.steam_id
+               AND user_id NOT IN (NEW.user_id, 0)
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'steam_links ownership conflict');
+        END
+      `,
+    ];
+    for (const sql of guardStatements) {
+      try {
+        db.prepare(sql).run();
+      } catch (err) {
+        const statement = String(sql).trim().split('\n')[0] || '';
+        log('warn', 'Failed to ensure steam_links ownership guardrail', {
+          statement,
+          error: err && err.message ? err.message : String(err),
+        });
+      }
+    }
+  }
+  ensureSteamLinkOwnershipGuardrails();
 
   db.prepare(`
     CREATE TABLE IF NOT EXISTS steam_friend_requests(
@@ -193,19 +254,54 @@ module.exports = (ctx) => {
   pruneSteamTasks('startup');
 
   // ---------- Prepared Statements ----------
+  const SENSITIVE_STEAM_TASK_TYPES = Object.freeze(['AUTH_GUARD_CODE', 'AUTH_LOGIN']);
+  const sensitiveTaskTypeListSql = SENSITIVE_STEAM_TASK_TYPES
+    .map((taskType) => `'${String(taskType).replace(/'/g, "''")}'`)
+    .join(', ');
+  const SENSITIVE_PENDING_TASK_TIMEOUT_S = 120;
   const selectPendingTaskStmt = db.prepare(`
     SELECT id, type, payload FROM steam_tasks
     WHERE status = 'PENDING'
     ORDER BY id ASC
     LIMIT 1
   `);
-  const markTaskRunningStmt = db.prepare(`
+  const markTaskRunningRowStmt = db.prepare(`
     UPDATE steam_tasks
        SET status = 'RUNNING',
            started_at = ?,
-           updated_at = ?
+           updated_at = ?,
+           payload = CASE
+             WHEN type IN (${sensitiveTaskTypeListSql}) THEN NULL
+             ELSE payload
+           END
      WHERE id = ? AND status = 'PENDING'
   `);
+  const claimPendingTaskTxn = db.transaction((startedAt, updatedAt) => {
+    const claimStartedAt = Number.isFinite(Number(startedAt))
+      ? Number(startedAt)
+      : Math.floor(Date.now() / 1000);
+    const claimUpdatedAt = Number.isFinite(Number(updatedAt))
+      ? Number(updatedAt)
+      : claimStartedAt;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const task = selectPendingTaskStmt.get();
+      if (!task) return null;
+
+      const updated = markTaskRunningRowStmt.run(claimStartedAt, claimUpdatedAt, task.id);
+      if (updated.changes) return task;
+    }
+
+    return null;
+  });
+  const markTaskRunningStmt = {
+    get(startedAt, updatedAt) {
+      return claimPendingTaskTxn(startedAt, updatedAt);
+    },
+    run(startedAt, updatedAt, taskId) {
+      return markTaskRunningRowStmt.run(startedAt, updatedAt, taskId);
+    },
+  };
   const resetTaskPendingStmt = db.prepare(`
     UPDATE steam_tasks
        SET status = 'PENDING',
@@ -217,16 +313,29 @@ module.exports = (ctx) => {
   const failStaleTasksStmt = db.prepare(`
     UPDATE steam_tasks
        SET status = 'FAILED',
-           error = 'Task stale: keine Antwort innerhalb ' || ? || 's',
-           finished_at = ?,
-           updated_at = ?
-     WHERE status = 'RUNNING'
+           payload = NULL,
+           error = CASE
+             WHEN status = 'RUNNING'
+               THEN 'Task stale: keine Antwort innerhalb ' || @running_timeout_s || 's'
+             ELSE 'Task stale: sensitiver Payload nach ' || @pending_timeout_s || 's ohne Abholung verworfen'
+           END,
+           finished_at = @now,
+           updated_at = @now
+     WHERE (
+           status = 'RUNNING'
        AND started_at IS NOT NULL
-       AND started_at < ?
+       AND started_at < @running_cutoff
+     ) OR (
+           type IN (${sensitiveTaskTypeListSql})
+       AND status = 'PENDING'
+       AND payload IS NOT NULL
+       AND updated_at < @pending_cutoff
+     )
   `);
   const finishTaskStmt = db.prepare(`
     UPDATE steam_tasks
        SET status = ?,
+           payload = NULL,
            result = ?,
            error = ?,
            finished_at = ?,
@@ -333,6 +442,13 @@ module.exports = (ctx) => {
       error=NULL,
       requested_at=CASE WHEN steam_friend_requests.status='sent' THEN strftime('%s','now') ELSE steam_friend_requests.requested_at END
   `);
+  const selectPendingFriendRequestForSteamIdStmt = db.prepare(`
+    SELECT steam_id, requested_at, attempts, last_attempt
+      FROM steam_friend_requests
+     WHERE steam_id=?
+       AND status='pending'
+     LIMIT 1
+  `);
   const selectFriendRequestBatchStmt = db.prepare(`
     SELECT steam_id, status, attempts, last_attempt
       FROM steam_friend_requests
@@ -374,20 +490,29 @@ module.exports = (ctx) => {
            updated_at = CURRENT_TIMESTAMP
      WHERE steam_id = ?
   `);
-  const verifySteamLinkStmt = db.prepare(`
+  const selectSteamLinkOwnersForSteamIdStmt = db.prepare(`
+    SELECT DISTINCT user_id
+      FROM steam_links
+     WHERE steam_id = ?
+       AND user_id != 0
+  ORDER BY user_id ASC
+  `);
+  const verifySteamLinkForUserStmt = db.prepare(`
     UPDATE steam_links
     SET verified = 1,
         is_steam_friend = 1,
         name = COALESCE(NULLIF(@name, ''), name),
         updated_at = CURRENT_TIMESTAMP
     WHERE steam_id = @steam_id
+      AND user_id = @user_id
   `);
-  const unverifySteamLinkStmt = db.prepare(`
+  const unverifySteamLinkForUserStmt = db.prepare(`
     UPDATE steam_links
     SET verified = 0,
         is_steam_friend = 0,
         updated_at = CURRENT_TIMESTAMP
-    WHERE steam_id = ?
+    WHERE steam_id = @steam_id
+      AND user_id = @user_id
   `);
 
   return {
@@ -397,6 +522,7 @@ module.exports = (ctx) => {
     installSteamTaskCapTrigger,
     pruneSteamTasks,
     STALE_TASK_TIMEOUT_S,
+    SENSITIVE_PENDING_TASK_TIMEOUT_S,
     // Task statements
     selectPendingTaskStmt,
     markTaskRunningStmt,
@@ -421,13 +547,15 @@ module.exports = (ctx) => {
     upsertFriendCheckCacheStmt,
     countFriendRequestsSentSinceStmt,
     upsertPendingFriendRequestStmt,
+    selectPendingFriendRequestForSteamIdStmt,
     selectFriendRequestBatchStmt,
     markFriendRequestSentStmt,
     markFriendRequestSkippedStmt,
     markFriendRequestFailedStmt,
     deleteFriendRequestStmt,
     clearFriendFlagStmt,
-    verifySteamLinkStmt,
-    unverifySteamLinkStmt,
+    selectSteamLinkOwnersForSteamIdStmt,
+    verifySteamLinkForUserStmt,
+    unverifySteamLinkForUserStmt,
   };
 };

@@ -57,7 +57,7 @@ BETA_MAIN_GUILD_ID = getattr(welcome_base, "MAIN_GUILD_ID", None)
 BETA_INVITE_PANEL_CUSTOM_ID = "betainvite:panel:start"
 BETA_INVITE_TICKET_CATEGORY_ID = 1478024871056248975
 BETA_INVITE_TICKET_NAME_PREFIX = "beta-invite"
-KOFI_VERIFICATION_TOKEN = os.getenv("KOFI_VERIFICATION_TOKEN")
+KOFI_VERIFICATION_TOKEN = (os.getenv("KOFI_VERIFICATION_TOKEN") or "").strip()
 
 BETA_TICKET_STATUS_OPEN = "open"
 BETA_TICKET_STATUS_COMPLETED = "completed"
@@ -3613,6 +3613,13 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         log.warning("Ko-fi Webhook deaktiviert (fastapi/uvicorn fehlt)")
         beta_invite._kofi_webhook_task = None
         return
+    if not KOFI_VERIFICATION_TOKEN:
+        message = "Ko-fi Webhook deaktiviert: KOFI_VERIFICATION_TOKEN fehlt oder ist leer."
+        log.error(message)
+        await beta_invite._notify_log_channel(message)
+        beta_invite._kofi_server = None
+        beta_invite._kofi_webhook_task = None
+        return
 
     # Ist bereits ein Ko-fi-Server erreichbar? Dann nicht doppelt starten.
     already_running, health_error = await asyncio.to_thread(
@@ -3693,8 +3700,11 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         _trace("kofi_webhook_http_received", payload_keys=payload_keys)
 
         token = _extract_kofi_token(payload, request.headers)
-        expected = str(KOFI_VERIFICATION_TOKEN or "").strip()
-        if expected and token != expected:
+        expected = KOFI_VERIFICATION_TOKEN
+        if not expected:
+            _trace("kofi_webhook_missing_verification_token")
+            raise HTTPException(status_code=503, detail="Webhook disabled")
+        if token != expected:
             _trace(
                 "kofi_webhook_invalid_verification_token",
                 token_present=bool(token),

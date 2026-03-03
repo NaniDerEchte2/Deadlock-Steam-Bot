@@ -46,8 +46,10 @@ class SteamLinkPanelView(discord.ui.View):
         from cogs.steam.steam_link_oauth import (
             LINK_COVER_IMAGE,
             LINK_COVER_LABEL,
+            LinkPanelView,
             PUBLIC_BASE_URL,
             STEAM_BUTTON_LABEL,
+            build_steam_login_start_url,
         )
 
         if not PUBLIC_BASE_URL:
@@ -58,10 +60,12 @@ class SteamLinkPanelView(discord.ui.View):
 
         uid = interaction.user.id
         desc = (
-            "Verknüpfe deinen Steam-Account direkt über Steam OpenID.\n\n"
+            "Schließe die Verknüpfung in zwei Schritten ab:\n"
+            "1. **Option 1 (OpenID):** Klicke unten auf den Steam-Button und melde dich bei Steam an.\n"
+            "2. **Option 2 (Freundescode):** Nutze unten den Button **Freundescode eingeben**.\n"
+            "   Wir senden automatisch eine Freundschaftsanfrage und prüfen bis zu 5 Minuten die Bestätigung.\n\n"
+            "Erst wenn beide Schritte erledigt sind, ist dein Account vollständig verknüpft.\n\n"
             "Das ist wichtig für korrekten Rang, den Live-Status in den Voice Lanes und die Spielersuche.\n\n"
-            "Wichtig: Sende dem Steam-Bot direkt eine Freundschaftsanfrage (Freundescode **820142646**), "
-            "sonst kann die Verknüpfung nicht abgeschlossen werden.\n\n"
             "Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>"
         )
         embed = discord.Embed(
@@ -71,14 +75,23 @@ class SteamLinkPanelView(discord.ui.View):
             embed.set_image(url=LINK_COVER_IMAGE)
         embed.set_author(name=LINK_COVER_LABEL)
 
-        view = discord.ui.View()
-        view.add_item(
-            discord.ui.Button(
-                style=discord.ButtonStyle.link,
-                label=STEAM_BUTTON_LABEL,
-                url=f"{PUBLIC_BASE_URL}/steam/login?uid={uid}",
+        link_cog = interaction.client.get_cog("SteamLink")
+        steam_start_url = build_steam_login_start_url(uid)
+        if link_cog is not None:
+            view = LinkPanelView(
+                user_id=uid,
+                steam_url=steam_start_url,
+                link_cog=link_cog,
             )
-        )
+        else:
+            view = discord.ui.View()
+            view.add_item(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.link,
+                    label=STEAM_BUTTON_LABEL,
+                    url=steam_start_url,
+                )
+            )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(
@@ -180,7 +193,11 @@ class SteamLinkPanel(commands.Cog):
         embed = discord.Embed(
             title="🔗 Steam Account verknüpfen",
             description=(
-                "Verknüpfe deinen Steam-Account\n\n"
+                "Verknüpfe deinen Steam-Account in zwei Schritten:\n"
+                "1. **Option 1 (OpenID):** Klicke auf den Steam-Button und melde dich bei Steam an.\n"
+                "2. **Option 2 (Freundescode):** Nutze den Button **Freundescode eingeben** im Panel.\n"
+                "   Wir senden automatisch eine Freundschaftsanfrage und prüfen bis zu 5 Minuten auf Bestätigung.\n\n"
+                "**Wichtig:** Die Verknüpfung ist erst abgeschlossen, wenn Option 1 und Option 2 erledigt sind.\n\n"
                 "**Was wird gespeichert?**\n"
                 "```txt\n"
                 "user_id: 662995601738170389\n"
@@ -196,16 +213,14 @@ class SteamLinkPanel(commands.Cog):
                 "- Wir speichern **keine Passwörter**\n"
                 "- Wir speichern **keine Login-Tokens** oder Session-Cookies\n"
                 "- Wir speichern **keine Zahlungsdaten**\n"
-                "- Wir speichern nur technisch nötige Daten  Discord-ID, SteamID64, Verknüpfungsstatus, Rank-Infos\n"
+                "- Wir speichern nur technisch nötige Daten: Discord-ID, SteamID64, Verknüpfungsstatus, Rank-Infos\n"
                 "- Es werden **keine Daten an Dritte weitergegeben**\n"
                 "- Du authentifizierst dich direkt bei Steam (OpenID), nicht über Passwort-Eingabe bei uns\n\n"
                 "**Open Source:** Unser Source Code ist öffentlich: <https://github.com/NaniDerEchte2/Deadlock-Bots>\n\n"
                 "**Was bringt das?**\n"
                 "- Dein Rang wird automatisch auf dem Server angezeigt\n"
                 "- Der Live-Status in den Voice Lanes funktioniert\n"
-                "- Du wirst in der Spieler-Suche korrekt eingestuft\n\n"
-                "**Wichtig:** Klick auf den Button und sende dem Steam-Bot eine Freundschaftsanfrage "
-                "(Freundescode **820142646**)."
+                "- Du wirst in der Spieler-Suche korrekt eingestuft"
             ),
             color=0x00AEEF,
         )

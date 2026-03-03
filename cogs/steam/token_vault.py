@@ -1,4 +1,4 @@
-"""Steam token storage helper (Windows Credential Manager with file fallback)."""
+"""Steam token storage helper (Windows Credential Manager with hardened file fallback)."""
 
 from __future__ import annotations
 
@@ -18,8 +18,15 @@ TOKEN_REFRESH_KEY = "STEAM_REFRESH_TOKEN"  # noqa: S105
 TOKEN_MACHINE_KEY = "STEAM_MACHINE_AUTH_TOKEN"  # noqa: S105
 TOKEN_REFRESH_SAVED_AT_KEY = "STEAM_REFRESH_TOKEN_SAVED_AT"  # noqa: S105
 TOKEN_MACHINE_SAVED_AT_KEY = "STEAM_MACHINE_AUTH_TOKEN_SAVED_AT"  # noqa: S105
+SECURE_TOKEN_DIR_NAME = ".vault"
+SECURE_REFRESH_FILE_NAME = "rt.bin"
+SECURE_MACHINE_FILE_NAME = "mt.bin"
+LEGACY_REFRESH_FILE_NAME = "refresh.token"
+LEGACY_MACHINE_FILE_NAME = "machine_auth_token.txt"
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
+INSECURE_FILE_FALLBACK_ENV = "STEAM_ALLOW_INSECURE_FILE_FALLBACK"
+WINDOWS_VAULT_LOCKED_MODE = "windows_vault_locked"
 
 
 def _flag_enabled(name: str, default: bool = True) -> bool:
@@ -29,8 +36,20 @@ def _flag_enabled(name: str, default: bool = True) -> bool:
     return raw not in _FALSE_VALUES
 
 
-def _vault_enabled() -> bool:
+def _vault_mode_requested() -> bool:
     return os.name == "nt" and _flag_enabled("STEAM_USE_WINDOWS_VAULT", True)
+
+
+def _vault_enabled() -> bool:
+    return _vault_mode_requested()
+
+
+def _file_fallback_allowed() -> bool:
+    if os.name != "nt":
+        return True
+    if not _vault_mode_requested():
+        return True
+    return _flag_enabled(INSECURE_FILE_FALLBACK_ENV, False)
 
 
 def _keyring_targets(secret_key: str) -> tuple[tuple[str, str], tuple[str, str]]:
@@ -50,15 +69,27 @@ def _get_keyring():
 
         return keyring
     except Exception:
-        log.debug(
-            "Steam vault backend unavailable; using file token storage.",
-            exc_info=log.isEnabledFor(logging.DEBUG),
-        )
+        if _file_fallback_allowed():
+            log.debug(
+                "Steam vault backend unavailable; using file token storage.",
+                exc_info=log.isEnabledFor(logging.DEBUG),
+            )
+        else:
+            log.warning(
+                "Steam vault backend unavailable; refusing insecure file token fallback on "
+                "Windows. Set %s=1 to opt in.",
+                INSECURE_FILE_FALLBACK_ENV,
+                exc_info=log.isEnabledFor(logging.DEBUG),
+            )
         return None
 
 
 def token_storage_mode() -> str:
-    return "windows_vault" if _get_keyring() is not None else "file"
+    if _get_keyring() is not None:
+        return "windows_vault"
+    if _vault_enabled() and not _file_fallback_allowed():
+        return WINDOWS_VAULT_LOCKED_MODE
+    return "file"
 
 
 def _presence_data_dir() -> Path:
@@ -68,12 +99,24 @@ def _presence_data_dir() -> Path:
     return Path(__file__).resolve().parent / "steam_presence" / ".steam-data"
 
 
+def _secure_token_dir() -> Path:
+    return _presence_data_dir() / SECURE_TOKEN_DIR_NAME
+
+
 def refresh_token_path() -> Path:
-    return _presence_data_dir() / "refresh.token"
+    return _secure_token_dir() / SECURE_REFRESH_FILE_NAME
 
 
 def machine_auth_token_path() -> Path:
-    return _presence_data_dir() / "machine_auth_token.txt"
+    return _secure_token_dir() / SECURE_MACHINE_FILE_NAME
+
+
+def _legacy_refresh_token_path() -> Path:
+    return _presence_data_dir() / LEGACY_REFRESH_FILE_NAME
+
+
+def _legacy_machine_auth_token_path() -> Path:
+    return _presence_data_dir() / LEGACY_MACHINE_FILE_NAME
 
 
 def _normalize_token(value: str | None) -> str:
@@ -90,12 +133,29 @@ def _read_token_file(path: Path) -> str:
         return ""
 
 
+def _set_path_mode(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
 def _write_token_file(path: Path, value: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _set_path_mode(path.parent, 0o700)
         path.write_text(f"{value}\n", encoding="utf-8")
+        _set_path_mode(path, 0o600)
     except Exception:
         log.exception("Failed to write Steam token file", extra={"path": str(path)})
+
+
+def _token_file_present(file_path: Path, legacy_file_path: Path | None = None) -> bool:
+    if _read_token_file(file_path):
+        return True
+    if legacy_file_path and legacy_file_path != file_path:
+        return bool(_read_token_file(legacy_file_path))
+    return False
 
 
 def _remove_file(path: Path) -> None:
@@ -184,21 +244,47 @@ def _read_token(
     token_key: str,
     saved_at_key: str,
     file_path: Path,
+    legacy_file_path: Path | None = None,
 ) -> str:
+    legacy_path = legacy_file_path if legacy_file_path and legacy_file_path != file_path else None
     token = _vault_get(token_key)
     if token:
         return token
 
+    if not _file_fallback_allowed():
+        return ""
+
     token = _read_token_file(file_path)
+    if token:
+        if _get_keyring() is not None and _vault_set(token_key, token):
+            saved_at = _file_mtime_iso(file_path) or _now_iso()
+            _vault_set(saved_at_key, saved_at)
+            _remove_file(file_path)
+            if legacy_path:
+                _remove_file(legacy_path)
+            log.info("Migrated Steam credential from file storage to Windows vault.")
+        return token
+
+    if not legacy_path:
+        return ""
+
+    token = _read_token_file(legacy_path)
     if not token:
         return ""
 
-    # One-way migration: file -> vault (if available), then remove file.
-    if _get_keyring() is not None and _vault_set(token_key, token):
-        saved_at = _file_mtime_iso(file_path) or _now_iso()
-        _vault_set(saved_at_key, saved_at)
-        _remove_file(file_path)
-        log.info("Migrated Steam credential from file storage to Windows vault.")
+    saved_at = _file_mtime_iso(legacy_path) or _now_iso()
+    storage = _write_token(
+        value=token,
+        token_key=token_key,
+        saved_at_key=saved_at_key,
+        file_path=file_path,
+        legacy_file_path=legacy_path,
+        saved_at_iso=saved_at,
+    )
+    if storage == "windows_vault":
+        log.info("Migrated Steam credential from legacy file storage to Windows vault.")
+    else:
+        log.info("Migrated Steam credential from legacy file storage to hardened fallback path.")
 
     return token
 
@@ -209,26 +295,41 @@ def _write_token(
     token_key: str,
     saved_at_key: str,
     file_path: Path,
+    legacy_file_path: Path | None = None,
     saved_at_iso: str | None = None,
 ) -> str:
     token = _normalize_token(value)
+    legacy_path = legacy_file_path if legacy_file_path and legacy_file_path != file_path else None
 
     if _get_keyring() is not None:
         if token:
             if _vault_set(token_key, token):
                 _vault_set(saved_at_key, saved_at_iso or _now_iso())
                 _remove_file(file_path)
+                if legacy_path:
+                    _remove_file(legacy_path)
                 return "windows_vault"
         else:
             _vault_delete(token_key)
             _vault_delete(saved_at_key)
             _remove_file(file_path)
+            if legacy_path:
+                _remove_file(legacy_path)
             return "windows_vault"
+
+    if not _file_fallback_allowed():
+        if not token:
+            _remove_file(file_path)
+            if legacy_path:
+                _remove_file(legacy_path)
+        return WINDOWS_VAULT_LOCKED_MODE
 
     if token:
         _write_token_file(file_path, token)
     else:
         _remove_file(file_path)
+    if legacy_path:
+        _remove_file(legacy_path)
     return "file"
 
 
@@ -237,6 +338,7 @@ def read_refresh_token(file_path: Path | None = None) -> str:
         token_key=TOKEN_REFRESH_KEY,
         saved_at_key=TOKEN_REFRESH_SAVED_AT_KEY,
         file_path=file_path or refresh_token_path(),
+        legacy_file_path=_legacy_refresh_token_path(),
     )
 
 
@@ -245,6 +347,7 @@ def read_machine_auth_token(file_path: Path | None = None) -> str:
         token_key=TOKEN_MACHINE_KEY,
         saved_at_key=TOKEN_MACHINE_SAVED_AT_KEY,
         file_path=file_path or machine_auth_token_path(),
+        legacy_file_path=_legacy_machine_auth_token_path(),
     )
 
 
@@ -259,6 +362,7 @@ def write_refresh_token(
         token_key=TOKEN_REFRESH_KEY,
         saved_at_key=TOKEN_REFRESH_SAVED_AT_KEY,
         file_path=file_path or refresh_token_path(),
+        legacy_file_path=_legacy_refresh_token_path(),
         saved_at_iso=saved_at_iso,
     )
 
@@ -274,6 +378,7 @@ def write_machine_auth_token(
         token_key=TOKEN_MACHINE_KEY,
         saved_at_key=TOKEN_MACHINE_SAVED_AT_KEY,
         file_path=file_path or machine_auth_token_path(),
+        legacy_file_path=_legacy_machine_auth_token_path(),
         saved_at_iso=saved_at_iso,
     )
 
@@ -281,13 +386,25 @@ def write_machine_auth_token(
 def refresh_token_exists(file_path: Path | None = None) -> bool:
     if _vault_get(TOKEN_REFRESH_KEY):
         return True
-    return bool(_read_token_file(file_path or refresh_token_path()))
+    if not _file_fallback_allowed():
+        return False
+    primary_path = file_path or refresh_token_path()
+    if _read_token_file(primary_path):
+        return True
+    legacy_path = _legacy_refresh_token_path()
+    return legacy_path != primary_path and bool(_read_token_file(legacy_path))
 
 
 def machine_auth_token_exists(file_path: Path | None = None) -> bool:
     if _vault_get(TOKEN_MACHINE_KEY):
         return True
-    return bool(_read_token_file(file_path or machine_auth_token_path()))
+    if not _file_fallback_allowed():
+        return False
+    primary_path = file_path or machine_auth_token_path()
+    if _read_token_file(primary_path):
+        return True
+    legacy_path = _legacy_machine_auth_token_path()
+    return legacy_path != primary_path and bool(_read_token_file(legacy_path))
 
 
 def get_refresh_token_age_days(file_path: Path | None = None) -> int | None:
@@ -298,10 +415,16 @@ def get_refresh_token_age_days(file_path: Path | None = None) -> int | None:
     if _vault_get(TOKEN_REFRESH_KEY):
         return 0
 
-    path = file_path or refresh_token_path()
-    token = _read_token_file(path)
-    if not token:
+    if not _file_fallback_allowed():
         return None
+
+    path = file_path or refresh_token_path()
+    if not _read_token_file(path):
+        legacy_path = _legacy_refresh_token_path()
+        if legacy_path != path and _read_token_file(legacy_path):
+            path = legacy_path
+        else:
+            return None
     try:
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
     except Exception:
@@ -318,9 +441,15 @@ def clear_tokens(
     refresh_path = refresh_file_path or refresh_token_path()
     machine_path = machine_file_path or machine_auth_token_path()
 
-    if refresh_token_exists(refresh_path):
+    if _vault_get(TOKEN_REFRESH_KEY) or _token_file_present(
+        refresh_path,
+        _legacy_refresh_token_path(),
+    ):
         removed.append("refresh_token")
-    if machine_auth_token_exists(machine_path):
+    if _vault_get(TOKEN_MACHINE_KEY) or _token_file_present(
+        machine_path,
+        _legacy_machine_auth_token_path(),
+    ):
         removed.append("machine_auth")
 
     write_refresh_token("", refresh_path)

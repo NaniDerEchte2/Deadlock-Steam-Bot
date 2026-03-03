@@ -46,6 +46,7 @@ module.exports = (ctx) => {
   function getStatusPayload() {
     return {
       account_name: runtimeState.account_name,
+      account_password_configured: Boolean(runtimeState.account_password_configured),
       logged_on: runtimeState.logged_on,
       logging_in: runtimeState.logging_in,
       steam_id64: runtimeState.steam_id64,

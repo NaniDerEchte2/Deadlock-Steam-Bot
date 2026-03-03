@@ -1,8 +1,12 @@
 # cogs/steam/steam_link_oauth.py
 import asyncio
+import hashlib
 import html
+import hmac
 import logging
 import re
+import secrets
+import threading
 import time
 import uuid
 from typing import Any
@@ -39,22 +43,254 @@ CLIENT_SECRET = (settings.discord_oauth_client_secret or "").strip()
 
 # State TTL
 STATE_TTL_SEC = 600  # 10 min
+STATE_MAX_ENTRIES = 4096
+STEAM_LOGIN_LAUNCH_TTL_SEC = 180
+FRIEND_CODE_SUBMIT_COOLDOWN_SEC = 12
+FRIEND_CODE_DEDUPE_WINDOW_SEC = 120
+FRIEND_CODE_TRACK_TTL_SEC = 900
+FRIEND_CODE_TRACK_MAX_USERS = 2048
+STATE_PRUNE_INTERVAL_SEC = 30
+FRIEND_CODE_PRUNE_INTERVAL_SEC = 30
+FRIEND_CODE_LINKING_ENABLED = False
+DISCORD_LOGIN_RATE_WINDOW_SEC = 60
+DISCORD_LOGIN_RATE_MAX_REQUESTS = 20
+DISCORD_LOGIN_RATE_TRACK_TTL_SEC = 600
+DISCORD_LOGIN_RATE_TRACK_MAX_KEYS = 4096
 
 # UI (deutsche Labels)
 LINK_COVER_IMAGE = settings.link_cover_image
 LINK_COVER_LABEL = settings.link_cover_label
 LINK_BUTTON_LABEL = settings.link_button_label
 STEAM_BUTTON_LABEL = settings.steam_button_label
+STEAM64_BASE = 76561197960265728
+MAX_STEAM_ACCOUNT_ID = 2**32 - 1
+FRIENDSHIP_VERIFY_TIMEOUT_SEC = 300  # 5 Minuten
+FRIENDSHIP_VERIFY_POLL_INTERVAL_SEC = 10
+_LAUNCH_TOKEN_FALLBACK_SECRET = secrets.token_bytes(32)
+_STEAM_LAUNCH_TOKEN_LOCK = threading.Lock()
+# Process-local issued-token cache: unconsumed launch tokens are only accepted once
+# and fail closed after expiry or process restart.
+_PENDING_STEAM_LAUNCHES: dict[str, int] = {}
+_DISCORD_LOGIN_RATE_LOCK = threading.Lock()
+_DISCORD_LOGIN_RATE_TRACK: dict[str, list[float]] = {}
 
 # ---------------------------------------------------------------------------
 # Öffentliche Schnittstelle für andere Cogs (Welcome-DM, Rules-Panel, etc.)
 # ---------------------------------------------------------------------------
-__all__ = ("get_public_urls", "start_urls_for")
+__all__ = ("get_public_urls", "start_urls_for", "build_steam_login_start_url")
 
 
 def _safe_log_repr(value: Any) -> str:
     """Return a repr-style string with control chars escaped for safe logging."""
     return repr(sanitize_log_value(value))
+
+
+def _friend_code_to_steam_id64(friend_code_raw: str) -> str:
+    code = str(friend_code_raw or "").strip().replace(" ", "").replace("-", "")
+    if not code:
+        raise ValueError("Bitte gib einen Steam-Freundescode ein.")
+    if not code.isdigit():
+        raise ValueError("Der Steam-Freundescode muss nur aus Zahlen bestehen.")
+
+    account_id = int(code)
+    if account_id <= 0:
+        raise ValueError("Der Steam-Freundescode muss größer als 0 sein.")
+    if account_id > MAX_STEAM_ACCOUNT_ID:
+        raise ValueError("Der Steam-Freundescode liegt außerhalb des gültigen Bereichs.")
+
+    steam_id64 = str(STEAM64_BASE + account_id)
+    if not re.fullmatch(r"\d{17,20}", steam_id64):
+        raise ValueError("Aus dem Freundescode konnte keine gültige SteamID64 erzeugt werden.")
+    return steam_id64
+
+
+def _friend_code_flow_disabled_message() -> str:
+    return (
+        "❌ Der Freundescode-Flow ist derzeit serverseitig deaktiviert, "
+        "weil damit kein belastbarer Ownership-Nachweis möglich ist. "
+        "Bitte nutze stattdessen den Steam-Login-Button."
+    )
+
+
+def _steam_launch_secret() -> bytes:
+    secret = CLIENT_SECRET
+    if secret:
+        return secret.encode("utf-8")
+    try:
+        api_key = (settings.steam_api_key.get_secret_value() if settings.steam_api_key else "").strip()
+    except Exception:
+        api_key = ""
+    if api_key:
+        return api_key.encode("utf-8")
+    return _LAUNCH_TOKEN_FALLBACK_SECRET
+
+
+def _sign_steam_launch_payload(payload: str) -> str:
+    return hmac.new(_steam_launch_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _prune_pending_steam_launches(*, now: int | None = None) -> None:
+    cutoff = int(time.time()) if now is None else int(now)
+    expired = [payload for payload, exp in _PENDING_STEAM_LAUNCHES.items() if exp <= cutoff]
+    for payload in expired:
+        _PENDING_STEAM_LAUNCHES.pop(payload, None)
+
+
+def _remember_steam_launch_payload(payload: str, *, exp: int) -> None:
+    now = int(time.time())
+    with _STEAM_LAUNCH_TOKEN_LOCK:
+        _prune_pending_steam_launches(now=now)
+        _PENDING_STEAM_LAUNCHES[payload] = int(exp)
+
+
+def _consume_steam_launch_payload(payload: str, *, exp: int) -> bool:
+    now = int(time.time())
+    with _STEAM_LAUNCH_TOKEN_LOCK:
+        _prune_pending_steam_launches(now=now)
+        tracked_exp = _PENDING_STEAM_LAUNCHES.get(payload)
+        if tracked_exp != int(exp) or int(exp) <= now:
+            _PENDING_STEAM_LAUNCHES.pop(payload, None)
+            return False
+        _PENDING_STEAM_LAUNCHES.pop(payload, None)
+        return True
+
+
+def _make_steam_launch_token(uid: int, *, ttl_sec: int = STEAM_LOGIN_LAUNCH_TTL_SEC) -> str:
+    now = int(time.time())
+    exp = now + max(30, int(ttl_sec))
+    nonce = secrets.token_hex(8)
+    payload = f"{int(uid)}.{exp}.{nonce}"
+    sig = _sign_steam_launch_payload(payload)
+    _remember_steam_launch_payload(payload, exp=exp)
+    return f"{payload}.{sig}"
+
+
+def _verify_steam_launch_token(token: str) -> int | None:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(".")
+    if len(parts) != 4:
+        return None
+    uid_raw, exp_raw, nonce, sig = parts
+    if not uid_raw.isdigit() or not exp_raw.isdigit():
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{16,64}", nonce):
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sig):
+        return None
+
+    uid = int(uid_raw)
+    exp = int(exp_raw)
+    if uid <= 0 or exp <= int(time.time()):
+        return None
+
+    payload = f"{uid}.{exp}.{nonce}"
+    expected = _sign_steam_launch_payload(payload)
+    if not hmac.compare_digest(sig.lower(), expected.lower()):
+        return None
+    if not _consume_steam_launch_payload(payload, exp=exp):
+        return None
+    return uid
+
+
+def _discord_login_client_key(request: web.Request) -> str:
+    forwarded_for = str(request.headers.get("X-Forwarded-For") or "").strip()
+    if forwarded_for:
+        client_ip = forwarded_for.split(",", 1)[0].strip()
+        if client_ip:
+            return client_ip
+
+    remote = str(getattr(request, "remote", "") or "").strip()
+    return remote or "unknown"
+
+
+def _consume_discord_login_budget(request: web.Request) -> bool:
+    now_mono = time.monotonic()
+    client_key = _discord_login_client_key(request)
+    window_cutoff = now_mono - DISCORD_LOGIN_RATE_WINDOW_SEC
+    track_cutoff = now_mono - DISCORD_LOGIN_RATE_TRACK_TTL_SEC
+
+    with _DISCORD_LOGIN_RATE_LOCK:
+        if _DISCORD_LOGIN_RATE_TRACK:
+            stale_keys = [
+                key
+                for key, stamps in _DISCORD_LOGIN_RATE_TRACK.items()
+                if not stamps or stamps[-1] <= track_cutoff
+            ]
+            for key in stale_keys:
+                _DISCORD_LOGIN_RATE_TRACK.pop(key, None)
+
+        stamps = [ts for ts in _DISCORD_LOGIN_RATE_TRACK.get(client_key, []) if ts > window_cutoff]
+        if len(stamps) >= DISCORD_LOGIN_RATE_MAX_REQUESTS:
+            _DISCORD_LOGIN_RATE_TRACK[client_key] = stamps
+            return False
+
+        stamps.append(now_mono)
+        _DISCORD_LOGIN_RATE_TRACK[client_key] = stamps
+
+        overflow = len(_DISCORD_LOGIN_RATE_TRACK) - DISCORD_LOGIN_RATE_TRACK_MAX_KEYS
+        if overflow > 0:
+            oldest_first = sorted(
+                _DISCORD_LOGIN_RATE_TRACK.items(),
+                key=lambda item: item[1][-1] if item[1] else 0.0,
+            )
+            for key, _ in oldest_first[:overflow]:
+                _DISCORD_LOGIN_RATE_TRACK.pop(key, None)
+
+    return True
+
+
+def build_steam_login_start_url(uid: int) -> str:
+    base = settings.public_base_url.rstrip("/")
+    if not base:
+        return ""
+    token = _make_steam_launch_token(int(uid))
+    return f"{base}/steam/login?launch={token}"
+
+
+class SteamFriendCodeModal(discord.ui.Modal, title="Steam-Freundescode"):
+    friend_code = discord.ui.TextInput(
+        label="Freundescode",
+        placeholder="z. B. 820142646",
+        required=True,
+        min_length=1,
+        max_length=32,
+    )
+
+    def __init__(self, *, user_id: int, link_cog: "SteamLink"):
+        super().__init__(timeout=300)
+        self.user_id = int(user_id)
+        self.link_cog = link_cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Nur der ursprüngliche Nutzer kann diesen Freundescode einreichen.",
+                ephemeral=True,
+            )
+            return
+        if not FRIEND_CODE_LINKING_ENABLED:
+            await interaction.response.send_message(
+                _friend_code_flow_disabled_message(),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.link_cog._handle_friend_code_submission(
+            interaction, str(self.friend_code.value or "")
+        )
+
+    async def on_error(self, interaction: discord.Interaction, _error: Exception) -> None:
+        log.exception("Friend-Code Modal fehlgeschlagen (user_id=%s)", self.user_id)
+        msg = "❌ Beim Verarbeiten des Freundescodes ist ein Fehler aufgetreten. Bitte versuche es erneut."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            log.debug("Konnte Modal-Fehlermeldung nicht senden", exc_info=True)
 
 
 class LinkPanelView(discord.ui.View):
@@ -68,6 +304,28 @@ class LinkPanelView(discord.ui.View):
                 label="Steam Account verknüpfen",
                 url=steam_url,
             )
+        )
+
+    @discord.ui.button(
+        label="Freundescode deaktiviert",
+        style=discord.ButtonStyle.secondary,
+        emoji="🚫",
+        custom_id="linkpanel_friend_code",
+    )
+    async def friend_code(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Nur der ursprüngliche Nutzer kann das verwenden.", ephemeral=True
+            )
+            return
+        if not FRIEND_CODE_LINKING_ENABLED:
+            await interaction.response.send_message(
+                _friend_code_flow_disabled_message(),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            SteamFriendCodeModal(user_id=self.user_id, link_cog=self.link_cog)
         )
 
     @discord.ui.button(
@@ -188,7 +446,7 @@ def get_public_urls() -> dict:
 
 def start_urls_for(uid: int) -> dict:
     """
-    Liefert user-spezifische Start-URLs MIT ?uid=... für Steam-OpenID.
+    Liefert user-spezifische Start-URLs.
     Wird vom SteamLinkStepView (Welcome-DM / Rules-Panel) beim Klick verwendet.
     """
     base = settings.public_base_url.rstrip("/")
@@ -199,11 +457,73 @@ def start_urls_for(uid: int) -> dict:
     u = int(uid)
     return {
         "discord_start": f"{base}/discord/login?uid={u}",
-        "steam_openid_start": f"{base}/steam/login?uid={u}",
+        "steam_openid_start": build_steam_login_start_url(u),
     }
 
 
 # ----------------------- DB-Schema -------------------------------------------
+def _ensure_steam_link_ownership_guardrails() -> None:
+    try:
+        db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_steam_links_steam_owner
+            ON steam_links(steam_id)
+            WHERE user_id != 0
+            """
+        )
+    except Exception:
+        log.warning(
+            "Konnte den eindeutigen Steam-Ownership-Index nicht anlegen "
+            "(evtl. historische Duplikate oder SQLite-Einschränkung).",
+            exc_info=True,
+        )
+
+    trigger_statements = [
+        "DROP TRIGGER IF EXISTS trg_steam_links_owner_guard_insert",
+        "DROP TRIGGER IF EXISTS trg_steam_links_owner_guard_update",
+        """
+        CREATE TRIGGER trg_steam_links_owner_guard_insert
+        BEFORE INSERT ON steam_links
+        FOR EACH ROW
+        WHEN NEW.user_id != 0
+          AND EXISTS (
+            SELECT 1
+            FROM steam_links
+            WHERE steam_id = NEW.steam_id
+              AND user_id NOT IN (NEW.user_id, 0)
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'steam_links ownership conflict');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_steam_links_owner_guard_update
+        BEFORE UPDATE OF user_id, steam_id ON steam_links
+        FOR EACH ROW
+        WHEN NEW.user_id != 0
+          AND (NEW.user_id != OLD.user_id OR NEW.steam_id != OLD.steam_id)
+          AND EXISTS (
+            SELECT 1
+            FROM steam_links
+            WHERE steam_id = NEW.steam_id
+              AND user_id NOT IN (NEW.user_id, 0)
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'steam_links ownership conflict');
+        END
+        """,
+    ]
+    for statement in trigger_statements:
+        try:
+            db.execute(statement)
+        except Exception:
+            log.warning(
+                "Konnte Steam-Ownership-Guardrail nicht sicherstellen.",
+                extra={"statement": statement.splitlines()[0].strip() if statement else ""},
+                exc_info=True,
+            )
+
+
 def _ensure_schema() -> None:
     db.execute(
         """
@@ -221,27 +541,87 @@ def _ensure_schema() -> None:
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_steam_links_user ON steam_links(user_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_steam_links_steam ON steam_links(steam_id)")
+    _ensure_steam_link_ownership_guardrails()
 
 
-def _save_steam_link_row(user_id: int, steam_id: str, name: str = "", verified: int = 0) -> None:
-    db.execute(
-        """
-        INSERT INTO steam_links(user_id, steam_id, name, verified)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id, steam_id) DO UPDATE SET
-          name=excluded.name,
-          verified=excluded.verified,
-          updated_at=CURRENT_TIMESTAMP
-        """,
-        (int(user_id), str(steam_id), name or "", int(verified)),
+def _find_conflicting_steam_link_user_id(user_id: int, steam_id: str) -> int | None:
+    row = db.query_one(
+        "SELECT user_id FROM steam_links WHERE steam_id=? AND user_id NOT IN (?, 0) LIMIT 1",
+        (str(steam_id), int(user_id)),
     )
+    if not row:
+        return None
     try:
-        queue_friend_request(steam_id)
+        return int(row["user_id"])
     except Exception:
+        return None
+
+
+def _save_steam_link_row(
+    user_id: int,
+    steam_id: str,
+    name: str = "",
+    verified: int = 0,
+    *,
+    source: str = "unknown",
+) -> dict[str, Any]:
+    target_user_id = int(user_id)
+    target_steam_id = str(steam_id)
+    conflicting_user_id = _find_conflicting_steam_link_user_id(target_user_id, target_steam_id)
+    if conflicting_user_id is not None:
+        log.warning(
+            "Blockiere Steam-Link-Speicherung wegen Ownership-Konflikt "
+            "(source=%s, user_id=%s, steam_id=%s, owner_user_id=%s)",
+            source,
+            target_user_id,
+            _safe_log_repr(target_steam_id),
+            conflicting_user_id,
+        )
+        return {
+            "saved": False,
+            "queue_ok": False,
+            "conflicting_user_id": conflicting_user_id,
+        }
+
+    try:
+        db.execute(
+            """
+            INSERT INTO steam_links(user_id, steam_id, name, verified)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id, steam_id) DO UPDATE SET
+              name=excluded.name,
+              verified=CASE WHEN verified > excluded.verified THEN verified ELSE excluded.verified END,
+              updated_at=CURRENT_TIMESTAMP
+            """,
+            (target_user_id, target_steam_id, name or "", int(verified)),
+        )
+    except Exception:
+        conflicting_user_id = _find_conflicting_steam_link_user_id(target_user_id, target_steam_id)
+        if conflicting_user_id is not None:
+            log.warning(
+                "Blockiere Steam-Link-Speicherung nach DB-Ownership-Guardrail "
+                "(source=%s, user_id=%s, steam_id=%s, owner_user_id=%s)",
+                source,
+                target_user_id,
+                _safe_log_repr(target_steam_id),
+                conflicting_user_id,
+            )
+            return {
+                "saved": False,
+                "queue_ok": False,
+                "conflicting_user_id": conflicting_user_id,
+            }
+        raise
+    queue_ok = True
+    try:
+        queue_friend_request(target_steam_id)
+    except Exception:
+        queue_ok = False
         log.exception(
             "Konnte Steam-Freundschaftsanfrage nicht einreihen (steam_id=%s)",
-            _safe_log_repr(steam_id),
+            _safe_log_repr(target_steam_id),
         )
+    return {"saved": True, "queue_ok": queue_ok, "conflicting_user_id": None}
 
 
 # ----------------------- Middleware (Top-Level) -------------------------------
@@ -317,7 +697,10 @@ class SteamLink(commands.Cog):
         self.app.router.add_get("/robots.txt", self.handle_robots)
 
         self._runner: web.AppRunner | None = None
-        self._states: dict[str, dict[str, float]] = {}  # state -> {uid, ts}
+        self._states: dict[str, dict[str, Any]] = {}  # state -> {uid, ts, context}
+        self._state_last_prune_ts = 0.0
+        self._friend_code_track: dict[int, dict[str, Any]] = {}
+        self._friend_code_track_last_prune_ts = 0.0
 
     # --------------- Lifecycle -----------------------------------------------
     async def cog_load(self) -> None:
@@ -387,12 +770,44 @@ class SteamLink(commands.Cog):
             self._runner = None
 
     # --------------- Helpers --------------------------------------------------
+    def _prune_states(self, *, now: float | None = None, force: bool = False) -> None:
+        now_ts = time.time() if now is None else float(now)
+        if (
+            not force
+            and len(self._states) < STATE_MAX_ENTRIES
+            and (now_ts - self._state_last_prune_ts) < STATE_PRUNE_INTERVAL_SEC
+        ):
+            return
+
+        if self._states:
+            expiry_cutoff = now_ts - STATE_TTL_SEC
+            stale_keys = [
+                key
+                for key, data in self._states.items()
+                if float(data.get("ts", 0.0)) <= expiry_cutoff
+            ]
+            for key in stale_keys:
+                self._states.pop(key, None)
+
+        self._state_last_prune_ts = now_ts
+
     def _mk_state(self, uid: int, context: str = "steam_link") -> str:
+        now_ts = time.time()
+        self._prune_states(now=now_ts, force=len(self._states) >= STATE_MAX_ENTRIES)
+        if len(self._states) >= STATE_MAX_ENTRIES:
+            log.warning(
+                "State map at capacity after prune (entries=%s, max=%s)",
+                len(self._states),
+                STATE_MAX_ENTRIES,
+            )
+            raise RuntimeError("state storage is temporarily saturated")
+
         s = uuid.uuid4().hex
-        self._states[s] = {"uid": int(uid), "ts": time.time(), "context": context}
+        self._states[s] = {"uid": int(uid), "ts": now_ts, "context": context}
         return s
 
     def _pop_state(self, s: str) -> int | None:
+        self._prune_states()
         data = self._states.pop(s, None)
         if not data:
             return None
@@ -402,12 +817,103 @@ class SteamLink(commands.Cog):
 
     def _pop_state_data(self, s: str) -> dict | None:
         """Returns full state dict including context, or None if missing/expired."""
+        self._prune_states()
         data = self._states.pop(s, None)
         if not data:
             return None
         if time.time() - data["ts"] > STATE_TTL_SEC:
             return None
         return data
+
+    def _prune_friend_code_track(self, *, now: float | None = None, force: bool = False) -> None:
+        now_mono = time.monotonic() if now is None else float(now)
+        if (
+            not force
+            and len(self._friend_code_track) < FRIEND_CODE_TRACK_MAX_USERS
+            and (now_mono - self._friend_code_track_last_prune_ts) < FRIEND_CODE_PRUNE_INTERVAL_SEC
+        ):
+            return
+
+        if self._friend_code_track:
+            expiry_cutoff = now_mono - FRIEND_CODE_TRACK_TTL_SEC
+            stale_user_ids = [
+                uid
+                for uid, data in self._friend_code_track.items()
+                if float(data.get("activity_ts", 0.0)) <= expiry_cutoff
+            ]
+            for uid in stale_user_ids:
+                self._friend_code_track.pop(uid, None)
+
+            overflow = len(self._friend_code_track) - FRIEND_CODE_TRACK_MAX_USERS
+            if overflow > 0:
+                oldest_first = sorted(
+                    self._friend_code_track.items(),
+                    key=lambda item: float(item[1].get("activity_ts", 0.0)),
+                )
+                for uid, _ in oldest_first[:overflow]:
+                    self._friend_code_track.pop(uid, None)
+
+        self._friend_code_track_last_prune_ts = now_mono
+
+    def _friend_code_bucket_for_user(self, user_id: int, *, now: float) -> dict[str, Any]:
+        uid = int(user_id)
+        needs_space = (
+            uid not in self._friend_code_track
+            and len(self._friend_code_track) >= FRIEND_CODE_TRACK_MAX_USERS
+        )
+        self._prune_friend_code_track(now=now, force=needs_space)
+
+        data = self._friend_code_track.get(uid)
+        if data is None:
+            if (
+                len(self._friend_code_track) >= FRIEND_CODE_TRACK_MAX_USERS
+                and self._friend_code_track
+            ):
+                oldest_uid = min(
+                    self._friend_code_track.items(),
+                    key=lambda item: float(item[1].get("activity_ts", 0.0)),
+                )[0]
+                self._friend_code_track.pop(oldest_uid, None)
+            data = {}
+            self._friend_code_track[uid] = data
+        data["activity_ts"] = now
+        return data
+
+    def _friend_code_cooldown_message(self, user_id: int) -> str | None:
+        now_mono = time.monotonic()
+        data = self._friend_code_bucket_for_user(user_id, now=now_mono)
+
+        elapsed = now_mono - float(data.get("submit_ts", 0.0))
+        remaining = FRIEND_CODE_SUBMIT_COOLDOWN_SEC - elapsed
+        if remaining > 0:
+            wait_sec = max(1, int(remaining + 0.999))
+            return (
+                "⏳ Bitte warte noch "
+                f"{wait_sec} Sekunden, bevor du erneut einen Freundescode einreichst."
+            )
+
+        data["submit_ts"] = now_mono
+        data["activity_ts"] = now_mono
+        return None
+
+    def _friend_code_dedupe_message(self, user_id: int, steam_id: str) -> str | None:
+        now_mono = time.monotonic()
+        data = self._friend_code_bucket_for_user(user_id, now=now_mono)
+
+        last_steam_id = str(data.get("steam_id", ""))
+        last_steam_id_ts = float(data.get("steam_id_ts", 0.0))
+        remaining = FRIEND_CODE_DEDUPE_WINDOW_SEC - (now_mono - last_steam_id_ts)
+        if last_steam_id == steam_id and remaining > 0:
+            wait_sec = max(1, int(remaining + 0.999))
+            return (
+                "ℹ️ Diesen Freundescode hast du gerade bereits eingereicht. "
+                f"Bitte warte noch {wait_sec} Sekunden."
+            )
+
+        data["steam_id"] = str(steam_id)
+        data["steam_id_ts"] = now_mono
+        data["activity_ts"] = now_mono
+        return None
 
     async def _kickoff_profile_card(self, steam_id: str) -> None:
         """
@@ -427,6 +933,209 @@ class SteamLink(commands.Cog):
                 )
 
         asyncio.create_task(_run(), name="steam-link-profilecard")
+
+    def _find_conflicting_steam_link_user(self, user_id: int, steam_id: str) -> int | None:
+        return _find_conflicting_steam_link_user_id(user_id, steam_id)
+
+    def _mark_steam_link_verified(self, user_id: int, steam_id: str) -> None:
+        try:
+            db.execute(
+                "UPDATE steam_links SET verified=1, is_steam_friend=1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND steam_id=?",
+                (int(user_id), str(steam_id)),
+            )
+            return
+        except Exception as exc:
+            if "is_steam_friend" not in str(exc):
+                log.debug(
+                    "Konnte is_steam_friend nicht setzen, fallback auf verified-only",
+                    exc_info=True,
+                )
+        try:
+            db.execute(
+                "UPDATE steam_links SET verified=1, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND steam_id=?",
+                (int(user_id), str(steam_id)),
+            )
+        except Exception:
+            log.exception(
+                "Konnte Steam-Link nicht als verified markieren (user_id=%s, steam_id=%s)",
+                user_id,
+                _safe_log_repr(steam_id),
+            )
+
+    async def _trigger_verified_role_assignment(self, user_id: int) -> None:
+        try:
+            verified_cog = self.bot.get_cog("SteamVerifiedRole")
+            if verified_cog and hasattr(verified_cog, "assign_verified_role_with_retries"):
+                await verified_cog.assign_verified_role_with_retries(int(user_id))
+        except Exception:
+            log.debug(
+                "Sofortige Rollenvergabe nach Verifikation fehlgeschlagen (user_id=%s)",
+                user_id,
+                exc_info=True,
+            )
+
+    async def _poll_friendship_verification(
+        self,
+        *,
+        user_id: int,
+        steam_id: str,
+        timeout_sec: int = FRIENDSHIP_VERIFY_TIMEOUT_SEC,
+        poll_interval_sec: int = FRIENDSHIP_VERIFY_POLL_INTERVAL_SEC,
+    ) -> tuple[str, str | None]:
+        deadline = time.monotonic() + max(5, int(timeout_sec))
+        last_error: str | None = None
+        had_successful_check = False
+
+        while time.monotonic() < deadline:
+            remaining = max(1.0, deadline - time.monotonic())
+            task_timeout = min(20.0, remaining)
+            try:
+                outcome = await self.tasks.run(
+                    "AUTH_CHECK_FRIENDSHIP",
+                    {"steam_id": str(steam_id)},
+                    timeout=task_timeout,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                log.debug(
+                    "AUTH_CHECK_FRIENDSHIP raised (user_id=%s, steam_id=%s)",
+                    user_id,
+                    _safe_log_repr(steam_id),
+                    exc_info=True,
+                )
+            else:
+                if outcome.ok and isinstance(outcome.result, dict):
+                    had_successful_check = True
+                    data = outcome.result.get("data")
+                    if isinstance(data, dict) and bool(data.get("friend")):
+                        self._mark_steam_link_verified(user_id, steam_id)
+                        await self._trigger_verified_role_assignment(user_id)
+                        return "verified", None
+                else:
+                    last_error = outcome.error or (
+                        "Timeout bei der Steam-Freundschaftsprüfung"
+                        if outcome.timed_out
+                        else "Steam-Freundschaftsprüfung fehlgeschlagen"
+                    )
+
+            sleep_for = min(
+                max(0, int(poll_interval_sec)),
+                max(0.0, deadline - time.monotonic()),
+            )
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        if had_successful_check:
+            return "timeout", None
+        return "error", last_error or "Keine gültige Antwort von Steam erhalten."
+
+    async def _handle_friend_code_submission(
+        self, interaction: discord.Interaction, friend_code_raw: str
+    ) -> None:
+        if not FRIEND_CODE_LINKING_ENABLED:
+            await interaction.followup.send(_friend_code_flow_disabled_message(), ephemeral=True)
+            return
+
+        user_id = int(interaction.user.id)
+
+        cooldown_msg = self._friend_code_cooldown_message(user_id)
+        if cooldown_msg:
+            await interaction.followup.send(cooldown_msg, ephemeral=True)
+            return
+
+        try:
+            steam_id = _friend_code_to_steam_id64(friend_code_raw)
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+
+        dedupe_msg = self._friend_code_dedupe_message(user_id, steam_id)
+        if dedupe_msg:
+            await interaction.followup.send(dedupe_msg, ephemeral=True)
+            return
+
+        display_name = await self._fetch_persona(steam_id) or await self._discord_at_name(user_id)
+        save_result = _save_steam_link_row(
+            user_id,
+            steam_id,
+            display_name,
+            verified=0,
+            source="friend_code_modal",
+        )
+        conflicting_user_id = save_result.get("conflicting_user_id")
+        if not save_result.get("saved") and conflicting_user_id is not None:
+            await interaction.followup.send(
+                "❌ Dieser Steam-Account ist bereits mit einem anderen Discord-Konto verknüpft. "
+                "Bitte nutze den korrekten Freundescode oder wende dich an das Team.",
+                ephemeral=True,
+            )
+            return
+
+        queue_ok = bool(save_result.get("queue_ok"))
+        await self._kickoff_profile_card(steam_id)
+
+        await interaction.followup.send(
+            (
+                f"⏳ SteamID64 gespeichert: `{steam_id}`.\n"
+                "Wir prüfen jetzt bis zu 5 Minuten automatisch, ob die Freundschaft bestätigt wird."
+            ),
+            ephemeral=True,
+        )
+
+        status, error_text = await self._poll_friendship_verification(
+            user_id=user_id,
+            steam_id=steam_id,
+        )
+
+        if status == "verified":
+            suffix = (
+                ""
+                if queue_ok
+                else "\n⚠️ Hinweis: Das Einreihen der Freundschaftsanfrage in die Queue war fehlerhaft."
+            )
+            await interaction.followup.send(
+                (
+                    f"✅ Verknüpfung erfolgreich bestätigt.\n"
+                    f"SteamID64: `{steam_id}`\n"
+                    "Die Steam-Freundschaft wurde erkannt und dein Link ist jetzt verifiziert."
+                    f"{suffix}"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if status == "timeout":
+            suffix = (
+                ""
+                if queue_ok
+                else "\n⚠️ Zusätzlich konnte die Freundschaftsanfrage nicht sauber in die Queue gelegt werden."
+            )
+            await interaction.followup.send(
+                (
+                    f"⏱️ Zeitlimit erreicht.\n"
+                    f"SteamID64: `{steam_id}` wurde gespeichert, aber innerhalb von 5 Minuten "
+                    "konnte keine bestätigte Freundschaft erkannt werden.\n"
+                    "Bitte nimm die Anfrage in Steam an und starte den Schritt danach erneut."
+                    f"{suffix}"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        suffix = (
+            ""
+            if queue_ok
+            else "\n⚠️ Die Freundschaftsanfrage konnte nicht in die Queue eingereiht werden."
+        )
+        await interaction.followup.send(
+            (
+                f"❌ Verifikation fehlgeschlagen.\n"
+                f"SteamID64: `{steam_id}` wurde gespeichert, aber die Freundschaft konnte nicht geprüft werden.\n"
+                f"Fehler: `{error_text or 'unbekannt'}`"
+                f"{suffix}"
+            ),
+            ephemeral=True,
+        )
 
     async def _discord_at_name(self, uid: int) -> str:
         try:
@@ -552,7 +1261,7 @@ class SteamLink(commands.Cog):
     def steam_start_url_for(self, uid: int) -> str:
         if not PUBLIC_BASE_URL:
             return ""
-        return f"{PUBLIC_BASE_URL}/steam/login?uid={int(uid)}"
+        return build_steam_login_start_url(int(uid))
 
     # Rückwärtskompatibel
     def build_discord_link_for(self, uid: int) -> str:
@@ -756,6 +1465,9 @@ class SteamLink(commands.Cog):
         return web.Response(text="User-agent: *\nDisallow: /\n", content_type="text/plain")
 
     async def handle_discord_login(self, request: web.Request) -> web.Response:
+        if not _consume_discord_login_budget(request):
+            return web.Response(text="too many login attempts, please retry later", status=429)
+
         context = request.query.get("context", "steam_link")
         if context == "turnier":
             uid = 0  # Will be determined after Discord OAuth; not needed for turnier flow
@@ -769,6 +1481,9 @@ class SteamLink(commands.Cog):
             raise web.HTTPFound(location=url)
         except web.HTTPFound:
             raise
+        except RuntimeError as exc:
+            log.warning("discord/login state allocation failed: %s", exc)
+            return web.Response(text="link flow is temporarily busy, please retry", status=503)
         except Exception as e:
             log.exception("discord/login failed: %s", e)
             return web.Response(text="failed to start oauth", status=500)
@@ -793,6 +1508,23 @@ class SteamLink(commands.Cog):
         at = token.get("access_token")
         if not at:
             return web.Response(text="no access_token", status=400)
+
+        if context != "turnier":
+            user_info = await self._discord_fetch_user(at)
+            if not user_info:
+                return web.Response(text="user fetch failed", status=400)
+            try:
+                actual_uid = int(user_info["id"])
+            except (KeyError, TypeError, ValueError):
+                log.warning("Discord callback returned invalid user payload (state_uid=%s)", uid)
+                return web.Response(text="invalid user payload", status=400)
+            if actual_uid != uid:
+                log.warning(
+                    "Discord OAuth user mismatch (state_uid=%s, actual_uid=%s)",
+                    uid,
+                    actual_uid,
+                )
+                return web.Response(text="discord user mismatch", status=403)
 
         # ── Turnier context: issue one-time token, redirect to turnier site ──
         if context == "turnier":
@@ -848,6 +1580,18 @@ class SteamLink(commands.Cog):
             raise web.HTTPFound(location=steam_login)
         except web.HTTPFound:
             raise
+        except RuntimeError:
+            log.warning("Discord callback: state allocation failed during Steam redirect")
+            return web.Response(
+                text=(
+                    "<html><body style='font-family: system-ui, sans-serif'>"
+                    "<h3>⚠️ Link-Service ist kurzzeitig ausgelastet</h3>"
+                    "<p>Bitte starte den Verknüpfungsprozess in Discord in wenigen Sekunden erneut.</p>"
+                    "</body></html>"
+                ),
+                content_type="text/html",
+                status=503,
+            )
         except Exception:
             log.exception("Discord callback: Weiterleitung zu Steam fehlgeschlagen")
             return web.Response(
@@ -862,16 +1606,26 @@ class SteamLink(commands.Cog):
             )
 
     async def handle_steam_login(self, request: web.Request) -> web.Response:
-        uid_q = request.query.get("uid")
-        if not uid_q or not uid_q.isdigit():
-            return web.Response(text="missing uid", status=400)
-        uid = int(uid_q)
-        s = self._mk_state(uid)
-        login_url = self._build_steam_login_url(s)
+        launch = request.query.get("launch")
+        if not launch:
+            return web.Response(text="missing launch", status=400)
+        if any(key != "launch" for key in request.query.keys()):
+            return web.Response(text="invalid launch", status=400)
+        uid = _verify_steam_launch_token(launch)
+        if not uid:
+            return web.Response(text="invalid launch", status=400)
         try:
+            s = self._mk_state(uid)
+            login_url = self._build_steam_login_url(s)
             raise web.HTTPFound(location=login_url)
         except web.HTTPFound:
             raise
+        except RuntimeError as exc:
+            log.warning("Steam login state allocation failed: %s", exc)
+            return web.Response(
+                text="steam login temporarily busy, please retry shortly",
+                status=503,
+            )
         except Exception:
             log.exception("Steam login redirect failed")
             return web.Response(text="failed to start steam login", status=500)
@@ -892,7 +1646,25 @@ class SteamLink(commands.Cog):
 
             display_name = await self._fetch_persona(steam_id) or await self._discord_at_name(uid)
             # Verified=0, da wir erst die Freundschaftsanfrage abwarten wollen
-            _save_steam_link_row(uid, steam_id, display_name, verified=0)
+            save_result = _save_steam_link_row(
+                uid,
+                steam_id,
+                display_name,
+                verified=0,
+                source="steam_openid_return",
+            )
+            if not save_result.get("saved") and save_result.get("conflicting_user_id") is not None:
+                return web.Response(
+                    text=(
+                        "<html><body style='font-family: system-ui, sans-serif'>"
+                        "<h3>❌ Verknüpfung blockiert</h3>"
+                        "<p>Diese SteamID ist bereits mit einem anderen Discord-Konto verknüpft.</p>"
+                        "<p>Bitte verwende den korrekten Steam-Account oder kontaktiere das Team.</p>"
+                        "</body></html>"
+                    ),
+                    content_type="text/html",
+                    status=409,
+                )
             await self._kickoff_profile_card(steam_id)
             await self._notify_user_linked(uid, [steam_id])
 
@@ -957,7 +1729,15 @@ class SteamLink(commands.Cog):
                     persona = await self._discord_at_name(uid)
 
                 # Wir setzen verified=0, damit der User erst Freund werden muss
-                _save_steam_link_row(uid, steam_id, persona, verified=0)
+                save_result = _save_steam_link_row(
+                    uid,
+                    steam_id,
+                    persona,
+                    verified=0,
+                    source="discord_connections",
+                )
+                if not save_result.get("saved"):
+                    continue
                 saved.append(steam_id)
                 await self._kickoff_profile_card(steam_id)
 
@@ -1008,7 +1788,9 @@ class SteamLink(commands.Cog):
 
     async def _send_account_link_panel(self, ctx: commands.Context) -> None:
         desc = (
-            "Verknüpfe deinen Steam-Account direkt über Steam OpenID.\n\n"
+            "Verknüpfe deinen Steam-Account über den Steam-Login-Button.\n"
+            "Der Freundescode-Flow ist derzeit serverseitig deaktiviert, "
+            "weil darüber kein belastbarer Ownership-Nachweis möglich ist.\n\n"
             "**Datenschutz-Kurzinfo:**\n"
             "- Discord erhält aus diesem Schritt keine zusätzlichen Daten.\n"
             "- Wir speichern nur die technisch nötigen IDs (Discord-ID und SteamID64).\n"
@@ -1034,13 +1816,43 @@ class SteamLink(commands.Cog):
             )
             return
 
-        steam_start_url = f"{PUBLIC_BASE_URL}/steam/login?uid={ctx.author.id}"
-        view = LinkPanelView(
-            user_id=ctx.author.id,
-            steam_url=steam_start_url,
-            link_cog=self,
-        )
-        await self._send_ephemeral(ctx, embed=embed, view=view)
+        def _fresh_link_view() -> LinkPanelView:
+            steam_start_url = build_steam_login_start_url(ctx.author.id)
+            return LinkPanelView(
+                user_id=ctx.author.id,
+                steam_url=steam_start_url,
+                link_cog=self,
+            )
+
+        if getattr(ctx, "interaction", None):
+            await self._send_ephemeral(ctx, embed=embed, view=_fresh_link_view())
+            return
+
+        if ctx.guild is None:
+            await ctx.reply(embed=embed, view=_fresh_link_view())
+            return
+
+        try:
+            await ctx.author.send(embed=embed, view=_fresh_link_view())
+        except discord.Forbidden:
+            await ctx.reply(
+                "Aus Sicherheitsgründen sende ich den Steam-Link nicht öffentlich. "
+                "Ich konnte dir keine DM schicken. Bitte aktiviere DMs oder nutze `/account_verknüpfen`."
+            )
+            return
+        except Exception as e:
+            log.info(
+                "Konnte sicheren Steam-Link nicht per DM senden (user_id=%s): %s",
+                getattr(ctx.author, "id", "?"),
+                e,
+            )
+            await ctx.reply(
+                "Aus Sicherheitsgründen sende ich den Steam-Link nicht öffentlich. "
+                "Bitte nutze `/account_verknüpfen` oder versuche es in einer DM."
+            )
+            return
+
+        await ctx.reply("Ich habe dir den Steam-Link aus Sicherheitsgründen per DM geschickt.")
 
     @discord.app_commands.allowed_installs(guilds=True, users=True)
     @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)

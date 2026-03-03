@@ -34,7 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_set = sub.add_parser("set", help="Write a token")
     p_set.add_argument("--token", required=True, choices=("refresh", "machine"))
-    p_set.add_argument("--value", required=True)
+    p_set.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the token value from stdin instead of process arguments",
+    )
     p_set.add_argument("--saved-at", default=None)
 
     p_delete = sub.add_parser("delete", help="Delete a token")
@@ -72,6 +76,17 @@ def _exists(token_name: str) -> bool:  # noqa: S105
     return machine_auth_token_exists()
 
 
+def _read_set_value(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    if not getattr(args, "stdin", False):
+        parser.error("set requires --stdin; token values are blocked in process arguments")
+
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    raw = stream.read()
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -84,7 +99,7 @@ def main() -> int:
             return 0
 
         if args.command == "set":
-            mode = _write(args.token, args.value, args.saved_at)
+            mode = _write(args.token, _read_set_value(parser, args), args.saved_at)
             sys.stdout.write(mode)
             return 0
 

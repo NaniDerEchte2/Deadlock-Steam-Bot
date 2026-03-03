@@ -5,6 +5,7 @@ module.exports = (context) => {
 
 // ---------- Task Dispatcher (Promise-fähig) ----------
 let taskInProgress = false;
+const SENSITIVE_PENDING_TASK_TIMEOUT_S = 120;
 
 function finalizeTaskRun(task, outcome) {
   // outcome kann sync (Objekt) oder Promise sein
@@ -28,12 +29,9 @@ function processNextTask() {
   let task = null;
   let isAsync = false;
   try {
-    task = selectPendingTaskStmt.get();
-    if (!task) return;
-
     const startedAt = nowSeconds();
-    const updated = markTaskRunningStmt.run(startedAt, startedAt, task.id);
-    if (!updated.changes) return;
+    task = markTaskRunningStmt.get(startedAt, startedAt);
+    if (!task) return;
 
     const payload = safeJsonParse(task.payload);
     log('info', 'Executing steam task', { id: task.id, type: task.type });
@@ -635,10 +633,19 @@ setInterval(() => {
   try {
     // Stale RUNNING Tasks aufräumen (z.B. nach Bridge-Crash)
     const now = nowSeconds();
-    const staleCutoff = now - STALE_TASK_TIMEOUT_S;
-    const staleResult = failStaleTasksStmt.run(STALE_TASK_TIMEOUT_S, now, now, staleCutoff);
+    const staleResult = failStaleTasksStmt.run({
+      now,
+      running_timeout_s: STALE_TASK_TIMEOUT_S,
+      running_cutoff: now - STALE_TASK_TIMEOUT_S,
+      pending_timeout_s: SENSITIVE_PENDING_TASK_TIMEOUT_S,
+      pending_cutoff: now - SENSITIVE_PENDING_TASK_TIMEOUT_S,
+    });
     if (staleResult.changes > 0) {
-      log('warn', 'Cleaned up stale RUNNING tasks', { count: staleResult.changes, cutoff_age_s: STALE_TASK_TIMEOUT_S });
+      log('warn', 'Cleaned up stale steam tasks', {
+        count: staleResult.changes,
+        running_timeout_s: STALE_TASK_TIMEOUT_S,
+        pending_timeout_s: SENSITIVE_PENDING_TASK_TIMEOUT_S,
+      });
       taskInProgress = false; // Erlaubt neuen Task nach Cleanup
     }
     processNextTask();

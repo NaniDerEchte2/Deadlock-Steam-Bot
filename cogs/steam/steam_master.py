@@ -35,13 +35,33 @@ from cogs.steam.token_vault import (
     clear_tokens as clear_steam_tokens,
 )
 from cogs.steam.token_vault import (
+    machine_auth_token_path,
     machine_auth_token_exists,
+    refresh_token_path,
     refresh_token_exists,
     token_storage_mode,
 )
 from service import db
 
 log = logging.getLogger(__name__)
+_AUTH_LOGIN_BLOCKED_PAYLOAD_FIELDS = frozenset(
+    {
+        "account_name",
+        "password",
+        "refresh_token",
+        "machine_auth_token",
+        "two_factor_code",
+        "auth_code",
+    }
+)
+
+
+def _payload_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
 
 
 class SteamMasterMode(enum.Enum):
@@ -60,13 +80,7 @@ class SteamLoginFlags(commands.FlagConverter, case_insensitive=True):
 
     use_refresh_token: bool | None = commands.flag(default=None, aliases=["refresh"])
     force_credentials: bool = commands.flag(default=False, aliases=["force", "credentials"])
-    account_name: str | None = commands.flag(default=None, aliases=["account", "user", "username"])
-    password: str | None = commands.flag(default=None, aliases=["pass", "pw"])
-    refresh_token: str | None = commands.flag(default=None, aliases=["rtoken"])
-    two_factor_code: str | None = commands.flag(default=None, aliases=["twofactor", "totp"])
-    auth_code: str | None = commands.flag(default=None, aliases=["guard"])
     remember_password: bool | None = commands.flag(default=None, aliases=["remember"])
-    machine_auth_token: str | None = commands.flag(default=None, aliases=["machine"])
 
 
 @dataclass(slots=True)
@@ -100,7 +114,32 @@ class SteamTaskClient:
         except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
             raise SteamTaskError(f"Ungültiger Payload für Steam-Task: {exc}") from exc
 
+    @staticmethod
+    def _validate_payload(task_type: str, payload: dict[str, Any] | None) -> None:
+        task_name = str(task_type).upper()
+        if task_name == "AUTH_GUARD_CODE":
+            raise SteamTaskError(
+                "AUTH_GUARD_CODE über den Python-Task-Client ist deaktiviert. "
+                "Nutze nur Bridge-lokale Steam-Guard-Automation."
+            )
+
+        if task_name != "AUTH_LOGIN" or not payload:
+            return
+
+        blocked = [
+            field
+            for field in _AUTH_LOGIN_BLOCKED_PAYLOAD_FIELDS
+            if field in payload and _payload_value_present(payload.get(field))
+        ]
+        if blocked:
+            fields = ", ".join(sorted(blocked))
+            raise SteamTaskError(
+                "AUTH_LOGIN-Payload enthält gesperrte sensible Felder "
+                f"({fields}). Hinterlege Credentials im Node-Worker bzw. Tokens im Vault."
+            )
+
     def enqueue(self, task_type: str, payload: dict[str, Any] | None = None) -> int:
+        self._validate_payload(task_type, payload)
         payload_json = self._encode_payload(payload)
         with db.get_conn() as conn:
             cur = conn.execute(
@@ -175,11 +214,11 @@ def _presence_data_dir() -> Path:
 
 
 def _refresh_token_path() -> Path:
-    return _presence_data_dir() / "refresh.token"
+    return refresh_token_path()
 
 
 def _machine_auth_path() -> Path:
-    return _presence_data_dir() / "machine_auth_token.txt"
+    return machine_auth_token_path()
 
 
 def _determine_mode() -> SteamMasterMode:
@@ -243,6 +282,36 @@ class SteamMaster(commands.Cog):
         """Expose the awaitable task helper for other components."""
 
         return await self.tasks.run(task_type, payload, timeout=timeout)
+
+    async def _best_effort_delete_invocation(self, ctx: commands.Context) -> None:
+        message = getattr(ctx, "message", None)
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except Exception:
+            log.debug("Failed to delete invoking Steam command message", exc_info=True)
+
+    @staticmethod
+    def _message_contains_sensitive_login_input(content: str) -> bool:
+        text = str(content or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "--password",
+                "--pass",
+                "--pw",
+                "--refresh_token",
+                "--rtoken",
+                "--machine_auth_token",
+                "--machine",
+                "--two_factor_code",
+                "--twofactor",
+                "--totp",
+                "--auth_code",
+                "--guard=",
+            )
+        )
 
     @staticmethod
     def _format_stats(title: str, stats: dict[str, int]) -> str:
@@ -331,8 +400,8 @@ class SteamMaster(commands.Cog):
 
         Beispiele:
         ``!steam_login`` – nutzt vorhandene Tokens/Zugangsdaten.
-        ``!steam_login --force --account=mybot --password=...`` – zwingt
-        Benutzername/Passwort.
+        ``!steam_login --force`` – erzwingt die im Node-Worker konfigurierten
+        Zugangsdaten statt eines Refresh-Tokens.
         ``!steam_login --refresh=false`` – unterdrückt den Refresh-Token.
         """
 
@@ -342,20 +411,8 @@ class SteamMaster(commands.Cog):
                 payload["use_refresh_token"] = bool(flags.use_refresh_token)
             if flags.force_credentials:
                 payload["force_credentials"] = True
-            if flags.account_name:
-                payload["account_name"] = flags.account_name
-            if flags.password:
-                payload["password"] = flags.password
-            if flags.refresh_token:
-                payload["refresh_token"] = flags.refresh_token
-            if flags.two_factor_code:
-                payload["two_factor_code"] = flags.two_factor_code
-            if flags.auth_code:
-                payload["auth_code"] = flags.auth_code
             if flags.remember_password is not None:
                 payload["remember_password"] = bool(flags.remember_password)
-            if flags.machine_auth_token:
-                payload["machine_auth_token"] = flags.machine_auth_token
 
         async with ctx.typing():
             outcome = await self.tasks.run("AUTH_LOGIN", payload or None, timeout=20.0)
@@ -378,30 +435,61 @@ class SteamMaster(commands.Cog):
         via = "Refresh-Token" if result.get("using_refresh_token") else "Zugangsdaten"
         await ctx.reply(f"✅ Login gestartet über {via}.")
 
+    @cmd_login.error
+    async def cmd_login_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(
+            error,
+            (
+                commands.BadArgument,
+                commands.BadFlagArgument,
+                commands.TooManyArguments,
+                commands.MissingRequiredArgument,
+            ),
+        ):
+            message_content = str(getattr(getattr(ctx, "message", None), "content", "") or "")
+            if self._message_contains_sensitive_login_input(message_content):
+                await self._best_effort_delete_invocation(ctx)
+                await ctx.send(
+                    "❌ Sensible `steam_login`-Flags sind deaktiviert. "
+                    "Nutze nur `--refresh`, `--force` und `--remember`; "
+                    "Secrets gehören ausschließlich in den Node-Worker oder den Token-Vault."
+                )
+                return
+
+            await ctx.send(
+                "❌ Ungültige `steam_login`-Syntax. Erlaubt sind nur "
+                "`--refresh`, `--force` und `--remember`."
+            )
+            return
+        raise error
+
     @commands.command(name="steam_guard", aliases=["sg", "steamguard"])
     @commands.has_permissions(administrator=True)
-    async def cmd_guard(self, ctx: commands.Context, code: str) -> None:
-        """Submit a Steam Guard code through the bridge."""
+    async def cmd_guard(self, ctx: commands.Context) -> None:
+        """Manual Steam Guard submission is disabled for safety."""
 
-        payload = {"code": code.strip()}
-        async with ctx.typing():
-            outcome = await self.tasks.run("AUTH_GUARD_CODE", payload, timeout=15.0)
+        await ctx.send(
+            "❌ Der manuelle `steam_guard`-Prefix-Command ist deaktiviert. "
+            "Steam-Guard-Codes werden nicht mehr per Discord-Chat angenommen."
+        )
 
-        if outcome.timed_out:
-            await ctx.reply(
-                f"⏳ Guard-Task #{outcome.task_id} wurde noch nicht vom Bridge-Worker verarbeitet."
+    @cmd_guard.error
+    async def cmd_guard_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(
+            error,
+            (
+                commands.BadArgument,
+                commands.TooManyArguments,
+                commands.MissingRequiredArgument,
+            ),
+        ):
+            await self._best_effort_delete_invocation(ctx)
+            await ctx.send(
+                "❌ Der manuelle `steam_guard`-Prefix-Command ist deaktiviert. "
+                "Steam-Guard-Codes werden nicht mehr per Discord-Chat angenommen."
             )
             return
-
-        if not outcome.ok:
-            await ctx.reply(
-                f"❌ Guard-Code fehlgeschlagen: {outcome.error or 'unbekannter Fehler'}"
-            )
-            return
-
-        result = outcome.result if isinstance(outcome.result, dict) else {}
-        guard_type = result.get("type") or "unbekannt"
-        await ctx.reply(f"✅ Guard-Code akzeptiert ({guard_type}).")
+        raise error
 
     @commands.command(name="steam_logout")
     @commands.has_permissions(administrator=True)
