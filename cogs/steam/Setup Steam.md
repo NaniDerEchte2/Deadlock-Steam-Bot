@@ -322,9 +322,13 @@ Invoke-WebRequest https://link.earlysalty.com/health -SkipCertificateCheck |
 Invoke-WebRequest 'https://link.earlysalty.com/steam/return?state=abc' `
   -MaximumRedirection 0 -SkipCertificateCheck | Select-Object StatusCode
 
-# Steam Login HTML → 200, enthält OpenID-URL
-$r = Invoke-WebRequest 'https://link.earlysalty.com/steam/login?uid=1' -SkipCertificateCheck
-$r.Content -match 'steamcommunity\.com/openid/login'
+# Steam Login ohne Token → 400 ("missing launch")
+Invoke-WebRequest 'https://link.earlysalty.com/steam/login' `
+  -MaximumRedirection 0 -SkipCertificateCheck | Select-Object StatusCode,Content
+
+# Legacy-Link (?uid=...) → 302 auf Discord-Login (kompatibel, sicherer Flow)
+Invoke-WebRequest 'https://link.earlysalty.com/steam/login?uid=1' `
+  -MaximumRedirection 0 -SkipCertificateCheck | Select-Object StatusCode,Headers
 ```
 
 **End-to-End (echter Flow):**

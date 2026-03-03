@@ -51,7 +51,13 @@ FRIEND_CODE_TRACK_TTL_SEC = 900
 FRIEND_CODE_TRACK_MAX_USERS = 2048
 STATE_PRUNE_INTERVAL_SEC = 30
 FRIEND_CODE_PRUNE_INTERVAL_SEC = 30
-FRIEND_CODE_LINKING_ENABLED = False
+_friend_code_linking_enabled_raw = getattr(settings, "friend_code_linking_enabled", True)
+if isinstance(_friend_code_linking_enabled_raw, bool):
+    FRIEND_CODE_LINKING_ENABLED = _friend_code_linking_enabled_raw
+else:
+    FRIEND_CODE_LINKING_ENABLED = (
+        str(_friend_code_linking_enabled_raw).strip().lower() not in {"0", "false", "off", "no"}
+    )
 DISCORD_LOGIN_RATE_WINDOW_SEC = 60
 DISCORD_LOGIN_RATE_MAX_REQUESTS = 20
 DISCORD_LOGIN_RATE_TRACK_TTL_SEC = 600
@@ -106,9 +112,8 @@ def _friend_code_to_steam_id64(friend_code_raw: str) -> str:
 
 def _friend_code_flow_disabled_message() -> str:
     return (
-        "❌ Der Freundescode-Flow ist derzeit serverseitig deaktiviert, "
-        "weil damit kein belastbarer Ownership-Nachweis möglich ist. "
-        "Bitte nutze stattdessen den Steam-Login-Button."
+        "❌ Der Freundescode-Flow ist aktuell deaktiviert. "
+        "Bitte nutze stattdessen den Steam-Login-Button oder kontaktiere das Team."
     )
 
 
@@ -307,9 +312,9 @@ class LinkPanelView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Freundescode deaktiviert",
+        label="Freundescode eingeben",
         style=discord.ButtonStyle.secondary,
-        emoji="🚫",
+        emoji="👥",
         custom_id="linkpanel_friend_code",
     )
     async def friend_code(self, interaction: discord.Interaction, _button: discord.ui.Button):
@@ -414,7 +419,9 @@ def _env_redirect() -> str:
 def get_public_urls() -> dict:
     """
     Quelle der Wahrheit für Start-/Callback-Links.
-    UI-Cogs importieren diese Funktion und hängen selbst '?uid=<discord_id>' an.
+    UI-Cogs sollten für user-spezifische Startlinks `start_urls_for(uid)` nutzen.
+    `steam_openid_start` ist nur der technische Einstiegspunkt und benötigt
+    einen gültigen `launch`-Token oder (legacy) `uid`.
     Kein Fallback: fehlt etwas Wesentliches -> ImportError (Start abbrechen).
     """
     base = settings.public_base_url.rstrip("/")
@@ -423,7 +430,7 @@ def get_public_urls() -> dict:
         raise ImportError("PUBLIC_BASE_URL ist nicht gesetzt – keine öffentlichen URLs verfügbar.")
 
     urls = {
-        # Startpunkte (an diese hängen die UIs ?uid=<id>)
+        # Startpunkte (user-spezifische Links über start_urls_for(uid))
         "discord_start": f"{base}/discord/login",
         "steam_openid_start": f"{base}/steam/login",
         # Callbacks (für Vollständigkeit/Debug)
@@ -612,12 +619,9 @@ def _save_steam_link_row(
                 "conflicting_user_id": conflicting_user_id,
             }
         raise
-    queue_ok = True
-    try:
-        queue_friend_request(target_steam_id)
-    except Exception:
-        queue_ok = False
-        log.exception(
+    queue_ok = bool(queue_friend_request(target_steam_id))
+    if not queue_ok:
+        log.warning(
             "Konnte Steam-Freundschaftsanfrage nicht einreihen (steam_id=%s)",
             _safe_log_repr(target_steam_id),
         )
@@ -1074,10 +1078,19 @@ class SteamLink(commands.Cog):
         queue_ok = bool(save_result.get("queue_ok"))
         await self._kickoff_profile_card(steam_id)
 
+        kickoff_hint = (
+            "Wir prüfen jetzt bis zu 5 Minuten automatisch, ob die Freundschaft bestätigt wird."
+            if queue_ok
+            else (
+                "⚠️ Die automatische Freundschaftsanfrage konnte nicht gesendet werden.\n"
+                "Bitte sende dem Steam-Bot jetzt manuell eine Freundschaftsanfrage "
+                "(Freundescode: **820142646**). Wir prüfen danach bis zu 5 Minuten automatisch weiter."
+            )
+        )
         await interaction.followup.send(
             (
                 f"⏳ SteamID64 gespeichert: `{steam_id}`.\n"
-                "Wir prüfen jetzt bis zu 5 Minuten automatisch, ob die Freundschaft bestätigt wird."
+                f"{kickoff_hint}"
             ),
             ephemeral=True,
         )
@@ -1108,7 +1121,11 @@ class SteamLink(commands.Cog):
             suffix = (
                 ""
                 if queue_ok
-                else "\n⚠️ Zusätzlich konnte die Freundschaftsanfrage nicht sauber in die Queue gelegt werden."
+                else (
+                    "\n⚠️ Zusätzlich konnte die Freundschaftsanfrage nicht sauber in die Queue gelegt werden.\n"
+                    "Bitte sende dem Steam-Bot manuell eine Freundschaftsanfrage "
+                    "(Freundescode: **820142646**)."
+                )
             )
             await interaction.followup.send(
                 (
@@ -1125,7 +1142,11 @@ class SteamLink(commands.Cog):
         suffix = (
             ""
             if queue_ok
-            else "\n⚠️ Die Freundschaftsanfrage konnte nicht in die Queue eingereiht werden."
+            else (
+                "\n⚠️ Die Freundschaftsanfrage konnte nicht in die Queue eingereiht werden.\n"
+                "Bitte sende dem Steam-Bot manuell eine Freundschaftsanfrage "
+                "(Freundescode: **820142646**)."
+            )
         )
         await interaction.followup.send(
             (
@@ -1193,9 +1214,11 @@ class SteamLink(commands.Cog):
                 extra={"user_id": user_id, "steam_id_count": len(steam_ids or [])},
             )
             return
+        queue_ok = True
         try:
-            queue_friend_requests(valid_ids)
+            queue_ok = bool(queue_friend_requests(valid_ids))
         except Exception:
+            queue_ok = False
             ids_for_log = valid_ids
             steam_id_count = len(ids_for_log)
             try:
@@ -1222,11 +1245,21 @@ class SteamLink(commands.Cog):
             if not user:
                 return
             await self._cleanup_recent_bot_dms(user, limit=25)
+            request_line = (
+                "🤝 Wir haben dir eine Freundschaftsanfrage gesendet. "
+                "Falls in Steam nichts ankommt, sende dem Steam-Bot manuell eine Anfrage "
+                "(Freundescode: **820142646**)."
+                if queue_ok
+                else (
+                    "⚠️ Die automatische Freundschaftsanfrage konnte nicht gesendet werden.\n"
+                    "Bitte sende dem Steam-Bot jetzt manuell eine Freundschaftsanfrage "
+                    "(Freundescode: **820142646**), damit die Verknüpfung vollständig aktiv wird."
+                )
+            )
             shine = (
                 "✅ **Steam-Verknüpfung erfolgreich.**\n"
                 "Diese Verknüpfung ist wichtig für deinen Rang, den Live-Status in den Voice Lanes und die Spielersuche.\n"
-                "🤝 Bitte sende dem Steam-Bot jetzt eine Freundschaftsanfrage "
-                "(Freundescode: **820142646**), damit die Verknüpfung vollständig aktiv wird."
+                f"{request_line}"
             )
             await user.send(shine)
         except Exception as e:
@@ -1607,28 +1640,43 @@ class SteamLink(commands.Cog):
 
     async def handle_steam_login(self, request: web.Request) -> web.Response:
         launch = request.query.get("launch")
-        if not launch:
-            return web.Response(text="missing launch", status=400)
-        if any(key != "launch" for key in request.query.keys()):
-            return web.Response(text="invalid launch", status=400)
-        uid = _verify_steam_launch_token(launch)
-        if not uid:
-            return web.Response(text="invalid launch", status=400)
-        try:
-            s = self._mk_state(uid)
-            login_url = self._build_steam_login_url(s)
-            raise web.HTTPFound(location=login_url)
-        except web.HTTPFound:
-            raise
-        except RuntimeError as exc:
-            log.warning("Steam login state allocation failed: %s", exc)
-            return web.Response(
-                text="steam login temporarily busy, please retry shortly",
-                status=503,
-            )
-        except Exception:
-            log.exception("Steam login redirect failed")
-            return web.Response(text="failed to start steam login", status=500)
+        if launch:
+            if any(key != "launch" for key in request.query.keys()):
+                return web.Response(text="invalid launch", status=400)
+            uid = _verify_steam_launch_token(launch)
+            if not uid:
+                return web.Response(text="invalid launch", status=400)
+            try:
+                s = self._mk_state(uid)
+                login_url = self._build_steam_login_url(s)
+                raise web.HTTPFound(location=login_url)
+            except web.HTTPFound:
+                raise
+            except RuntimeError as exc:
+                log.warning("Steam login state allocation failed: %s", exc)
+                return web.Response(
+                    text="steam login temporarily busy, please retry shortly",
+                    status=503,
+                )
+            except Exception:
+                log.exception("Steam login redirect failed")
+                return web.Response(text="failed to start steam login", status=500)
+
+        # Legacy compatibility path: old links used /steam/login?uid=<discord_id>.
+        # Keep this secure by forcing users through Discord OAuth first.
+        uid_q = request.query.get("uid")
+        if uid_q:
+            if any(key != "uid" for key in request.query.keys()):
+                return web.Response(text="invalid launch", status=400)
+            if not uid_q.isdigit():
+                return web.Response(text="invalid uid", status=400)
+            legacy_uid = int(uid_q)
+            if legacy_uid <= 0:
+                return web.Response(text="invalid uid", status=400)
+            log.info("Legacy steam/login uid flow used; redirecting to Discord OAuth.")
+            raise web.HTTPFound(location=f"/discord/login?uid={legacy_uid}")
+
+        return web.Response(text="missing launch", status=400)
 
     async def handle_steam_return(self, request: web.Request) -> web.Response:
         try:
@@ -1788,9 +1836,11 @@ class SteamLink(commands.Cog):
 
     async def _send_account_link_panel(self, ctx: commands.Context) -> None:
         desc = (
-            "Verknüpfe deinen Steam-Account über den Steam-Login-Button.\n"
-            "Der Freundescode-Flow ist derzeit serverseitig deaktiviert, "
-            "weil darüber kein belastbarer Ownership-Nachweis möglich ist.\n\n"
+            "Verknüpfe deinen Steam-Account in zwei Schritten:\n"
+            "1. Klicke auf den Steam-Login-Button und melde dich bei Steam an.\n"
+            "2. Nutze den Button **Freundescode eingeben**.\n"
+            "   Wir senden automatisch eine Freundschaftsanfrage und prüfen bis zu 5 Minuten "
+            "auf Bestätigung.\n\n"
             "**Datenschutz-Kurzinfo:**\n"
             "- Discord erhält aus diesem Schritt keine zusätzlichen Daten.\n"
             "- Wir speichern nur die technisch nötigen IDs (Discord-ID und SteamID64).\n"

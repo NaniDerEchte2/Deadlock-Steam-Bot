@@ -22,20 +22,21 @@ CREATE TABLE IF NOT EXISTS steam_friend_requests(
 """
 
 
-def _ensure_table() -> None:
+def _ensure_table() -> bool:
     try:
         db.execute(_CREATE_SQL)
+        return True
     except Exception:
         log.exception("Failed to ensure steam_friend_requests table exists")
-        raise
+        return False
 
 
-def _queue_single(steam_id: str, trigger_task: bool = False) -> None:
+def _queue_single(steam_id: str, trigger_task: bool = False) -> bool:
     if not steam_id:
-        return
+        return False
     sid = str(steam_id).strip()
     if not sid:
-        return
+        return False
     try:
         # 1. Passive Queue (für Retry/Status-Tracking)
         db.execute(
@@ -59,6 +60,7 @@ def _queue_single(steam_id: str, trigger_task: bool = False) -> None:
                 "INSERT INTO steam_tasks(type, payload, status) VALUES (?, ?, 'PENDING')",
                 ("AUTH_SEND_FRIEND_REQUEST", payload),
             )
+        return True
     except Exception:
         log.exception(
             "Failed to queue Steam friend request",
@@ -67,21 +69,27 @@ def _queue_single(steam_id: str, trigger_task: bool = False) -> None:
                 "steam_id_valid": bool(re.fullmatch(r"\d{17,20}", sid)),
             },
         )
+        return False
 
 
-def queue_friend_requests(steam_ids: Iterable[str]) -> None:
+def queue_friend_requests(steam_ids: Iterable[str]) -> bool:
     """Queue outgoing Steam friend requests for the given SteamIDs."""
     if not steam_ids:
-        return
-    _ensure_table()
+        return True
+    if not _ensure_table():
+        return False
+    ok = True
     for steam_id in steam_ids:
-        _queue_single(steam_id, trigger_task=True)
+        if not _queue_single(steam_id, trigger_task=True):
+            ok = False
+    return ok
 
 
-def queue_friend_request(steam_id: str) -> None:
+def queue_friend_request(steam_id: str) -> bool:
     """Queue a single outgoing Steam friend request."""
-    _ensure_table()
-    _queue_single(steam_id, trigger_task=True)
+    if not _ensure_table():
+        return False
+    return _queue_single(steam_id, trigger_task=True)
 
 
 __all__ = ["queue_friend_request", "queue_friend_requests"]
