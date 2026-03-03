@@ -87,6 +87,7 @@ BETA_INVITE_INTENT_PROMPT_TEXT = (
     "Kurze Frage bevor wir loslegen: Willst du hier aktiv mitspielen bzw. aktiv in der Community sein "
     "oder nur schnell einen Invite abholen?"
 )
+PENDING_PAYMENT_TTL_SECONDS = 24 * 3600
 
 
 def _make_payment_message(token: str) -> str:
@@ -457,22 +458,39 @@ def _ensure_pending_payments_table() -> None:
               discord_name TEXT NOT NULL,
               created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
               token TEXT,
-              paid_at INTEGER
+              paid_at INTEGER,
+              consumed_at INTEGER
             )
             """
         )
-        try:
-            conn.execute(
-                "ALTER TABLE beta_invite_pending_payments ADD COLUMN token TEXT"
-            )
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                "ALTER TABLE beta_invite_pending_payments ADD COLUMN paid_at INTEGER"
-            )
-        except Exception:
-            pass
+        migration_steps = [
+            ("ALTER TABLE beta_invite_pending_payments ADD COLUMN token TEXT", "token"),
+            (
+                "ALTER TABLE beta_invite_pending_payments ADD COLUMN paid_at INTEGER",
+                "paid_at",
+            ),
+            (
+                "ALTER TABLE beta_invite_pending_payments ADD COLUMN consumed_at INTEGER",
+                "consumed_at",
+            ),
+        ]
+        for statement, column_name in migration_steps:
+            try:
+                conn.execute(statement)
+            except Exception as exc:
+                if "duplicate column name" in str(exc).lower():
+                    continue
+                log.exception(
+                    "Migration fehlgeschlagen: pending_payments.%s konnte nicht angelegt werden",
+                    column_name,
+                )
+                raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_beta_invite_pending_payments_token ON beta_invite_pending_payments(token)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_beta_invite_pending_payments_created_at ON beta_invite_pending_payments(created_at)"
+        )
 
 
 @dataclass(slots=True)
@@ -736,34 +754,51 @@ def _persist_intent_once(discord_id: int, intent: str) -> BetaIntentDecision:
 def _register_pending_payment(discord_id: int, discord_name: str) -> str:
     """Registriert eine ausstehende Zahlung und gibt den zugehörigen Token zurück."""
     now_ts = int(time.time())
+    expiry_cutoff = now_ts - PENDING_PAYMENT_TTL_SECONDS
     token = f"DDL-{secrets.token_hex(4).upper()}"
+    clean_name = str(discord_name or "").strip() or str(discord_id)
     with db.get_conn() as conn:
-        # Prüfe ob bereits ein Token existiert (bei erneutem Klick alten Token wiederverwenden)
         existing = conn.execute(
-            "SELECT token FROM beta_invite_pending_payments WHERE discord_id = ?",
+            """
+            SELECT token, created_at, consumed_at
+            FROM beta_invite_pending_payments
+            WHERE discord_id = ?
+            """,
             (int(discord_id),),
         ).fetchone()
         if existing and existing["token"]:
-            return existing["token"]
+            created_at = int(existing["created_at"] or 0)
+            consumed_at = existing["consumed_at"] if "consumed_at" in existing.keys() else None
+            if consumed_at is None and created_at >= expiry_cutoff:
+                return str(existing["token"])
         conn.execute(
             """
-            INSERT INTO beta_invite_pending_payments(discord_id, discord_name, token, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO beta_invite_pending_payments(discord_id, discord_name, token, created_at, paid_at, consumed_at)
+            VALUES (?, ?, ?, ?, NULL, NULL)
             ON CONFLICT(discord_id) DO UPDATE SET
                 discord_name=excluded.discord_name,
-                token=COALESCE(token, excluded.token),
-                created_at=excluded.created_at
+                token=excluded.token,
+                created_at=excluded.created_at,
+                paid_at=NULL,
+                consumed_at=NULL
             """,
-            (int(discord_id), str(discord_name), token, now_ts),
+            (int(discord_id), clean_name, token, now_ts),
         )
-    return token
+        row = conn.execute(
+            "SELECT token FROM beta_invite_pending_payments WHERE discord_id = ?",
+            (int(discord_id),),
+        ).fetchone()
+    if row and row["token"]:
+        return str(row["token"])
+    raise RuntimeError("Konnte payment token nicht speichern")
 
 
 def _is_payment_confirmed(discord_id: int) -> bool:
+    expiry_cutoff = int(time.time()) - PENDING_PAYMENT_TTL_SECONDS
     with db.get_conn() as conn:
         row = conn.execute(
             """
-            SELECT paid_at
+            SELECT paid_at, consumed_at, created_at
             FROM beta_invite_pending_payments
             WHERE discord_id = ?
             """,
@@ -772,19 +807,59 @@ def _is_payment_confirmed(discord_id: int) -> bool:
     if not row:
         return False
     paid_at = row["paid_at"] if "paid_at" in row.keys() else None
-    return paid_at is not None
+    consumed_at = row["consumed_at"] if "consumed_at" in row.keys() else None
+    created_at = int(row["created_at"] or 0) if "created_at" in row.keys() else 0
+    return (
+        paid_at is not None
+        and consumed_at is None
+        and created_at >= expiry_cutoff
+        and int(paid_at) >= expiry_cutoff
+    )
 
 
-def _mark_payment_confirmed(discord_id: int) -> None:
+def _consume_payment_for_invite(discord_id: int) -> bool:
+    """Verbraucht eine bestätigte Zahlung genau einmal für den Invite-Gate."""
+    now_ts = int(time.time())
+    expiry_cutoff = now_ts - PENDING_PAYMENT_TTL_SECONDS
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE beta_invite_pending_payments
+            SET consumed_at = ?
+            WHERE discord_id = ?
+              AND paid_at IS NOT NULL
+              AND consumed_at IS NULL
+              AND created_at >= ?
+              AND paid_at >= ?
+            """,
+            (now_ts, int(discord_id), expiry_cutoff, expiry_cutoff),
+        )
+    return (cur.rowcount or 0) > 0
+
+
+def _mark_payment_confirmed(discord_id: int, discord_name: str | None = None) -> bool:
+    clean_name = str(discord_name or "").strip() or str(discord_id)
     with db.get_conn() as conn:
         conn.execute(
             """
-            UPDATE beta_invite_pending_payments
-            SET paid_at = strftime('%s','now')
+            INSERT INTO beta_invite_pending_payments(discord_id, discord_name, created_at, paid_at, consumed_at)
+            VALUES (?, ?, strftime('%s','now'), strftime('%s','now'), NULL)
+            ON CONFLICT(discord_id) DO UPDATE SET
+              discord_name = excluded.discord_name,
+              paid_at = excluded.paid_at,
+              consumed_at = NULL
+            """,
+            (int(discord_id), clean_name),
+        )
+        row = conn.execute(
+            """
+            SELECT paid_at
+            FROM beta_invite_pending_payments
             WHERE discord_id = ?
             """,
             (int(discord_id),),
-        )
+        ).fetchone()
+    return bool(row and row["paid_at"] is not None)
 
 
 def _get_pending_payment_by_token(token: str) -> int | None:
@@ -792,10 +867,17 @@ def _get_pending_payment_by_token(token: str) -> int | None:
     clean = token.strip().upper()
     if not clean:
         return None
+    cutoff = int(time.time()) - PENDING_PAYMENT_TTL_SECONDS
     with db.get_conn() as conn:
         row = conn.execute(
-            "SELECT discord_id FROM beta_invite_pending_payments WHERE UPPER(token) = ?",
-            (clean,),
+            """
+            SELECT discord_id
+            FROM beta_invite_pending_payments
+            WHERE UPPER(token) = ?
+              AND consumed_at IS NULL
+              AND created_at >= ?
+            """,
+            (clean, cutoff),
         ).fetchone()
         if row:
             return int(row["discord_id"])
@@ -804,6 +886,7 @@ def _get_pending_payment_by_token(token: str) -> int | None:
 
 def _get_pending_payment(username_or_id: str | int) -> int | None:
     """Sucht nach einer offenen Zahlung via ID oder Name (Username-Case-Insensitive)."""
+    cutoff = int(time.time()) - PENDING_PAYMENT_TTL_SECONDS
     with db.get_conn() as conn:
         # Erst nach ID suchen
         d_id: int | None = None
@@ -814,8 +897,14 @@ def _get_pending_payment(username_or_id: str | int) -> int | None:
 
         if d_id is not None:
             row = conn.execute(
-                "SELECT discord_id FROM beta_invite_pending_payments WHERE discord_id = ?",
-                (d_id,),
+                """
+                SELECT discord_id
+                FROM beta_invite_pending_payments
+                WHERE discord_id = ?
+                  AND consumed_at IS NULL
+                  AND created_at >= ?
+                """,
+                (d_id, cutoff),
             ).fetchone()
             if row:
                 return int(row["discord_id"])
@@ -823,8 +912,14 @@ def _get_pending_payment(username_or_id: str | int) -> int | None:
         # Dann nach Name suchen (Case-Insensitive)
         name_clean = str(username_or_id).strip().lstrip("@").lower()
         row = conn.execute(
-            "SELECT discord_id FROM beta_invite_pending_payments WHERE LOWER(discord_name) = ?",
-            (name_clean,),
+            """
+            SELECT discord_id
+            FROM beta_invite_pending_payments
+            WHERE LOWER(discord_name) = ?
+              AND consumed_at IS NULL
+              AND created_at >= ?
+            """,
+            (name_clean, cutoff),
         ).fetchone()
         if row:
             return int(row["discord_id"])
@@ -1689,7 +1784,7 @@ class BetaInviteFlow(commands.Cog):
         self,
         interaction: discord.Interaction,
         steam_id64: str,
-    ) -> None:
+    ) -> bool:
         try:
             _queue_manual_friend_accept(steam_id64)
         except Exception:
@@ -1697,12 +1792,27 @@ class BetaInviteFlow(commands.Cog):
                 "Konnte manuelle Steam-Freundschaftsfreigabe nicht eintragen (steam_id=%s)",
                 steam_id64,
             )
+            retry_view = self._build_link_prompt_view(
+                interaction.user,
+                next_handler=self._continue_ticket_after_steam_link,
+            )
+            await self._edit_original_response(
+                interaction,
+                content=(
+                    "❌ Wir konnten deine Freundschaft intern gerade nicht vormerken.\n"
+                    "Bitte klicke in ein paar Sekunden erneut auf **Weiter**.\n"
+                    f"Falls es weiterhin fehlschlägt: {BETA_INVITE_SUPPORT_CONTACT}"
+                ),
+                view=retry_view,
+            )
+            return False
         view = BetaInviteFriendHintView(self, interaction.user.id)
         await self._edit_original_response(
             interaction,
             content=_manual_friend_request_workaround_text(),
             view=view,
         )
+        return True
 
     async def _continue_ticket_after_steam_link(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "ticket.step_steam_link_continue")
@@ -1720,7 +1830,9 @@ class BetaInviteFlow(commands.Cog):
             _trace("betainvite_no_link", discord_id=interaction.user.id)
             return
 
-        await self._send_ticket_friend_hint_step(interaction, steam_id)
+        queued_ok = await self._send_ticket_friend_hint_step(interaction, steam_id)
+        if not queued_ok:
+            return
 
     async def _continue_ticket_after_friend_hint(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "ticket.step_friend_hint_continue")
@@ -1737,7 +1849,7 @@ class BetaInviteFlow(commands.Cog):
             )
             return
 
-        if not _is_payment_confirmed(interaction.user.id):
+        if not _consume_payment_for_invite(interaction.user.id):
             payment_token = _register_pending_payment(interaction.user.id, interaction.user.name)
             view = InviteOnlyPaymentView(self, interaction.user.id, KOFI_PAYMENT_URL)
             await self._response_edit_message(
@@ -2225,47 +2337,54 @@ class BetaInviteFlow(commands.Cog):
             return {"ok": False, "reason": "missing_message"}
 
         # Token-Lookup (primär): Format DDL-XXXXXXXX
-        member = None
         token_candidate = raw_message.strip().upper()
         pending_id = _get_pending_payment_by_token(token_candidate)
-        if pending_id:
-            member = guild.get_member(pending_id)
-            if not member:
-                try:
-                    member = await guild.fetch_member(pending_id)
-                except Exception:
-                    log.debug("Could not fetch member from pending_id %s", pending_id)
-
-        # Fallback: Alter Username-basierter Lookup (für Abwärtskompatibilität)
-        if member is None:
+        if not pending_id:
             username_candidate = self._extract_discord_username(raw_message)
-            if username_candidate:
-                pending_id_by_name = _get_pending_payment(username_candidate)
-                if pending_id_by_name:
-                    member = guild.get_member(pending_id_by_name)
-                    if not member:
-                        try:
-                            member = await guild.fetch_member(pending_id_by_name)
-                        except Exception:
-                            log.debug(
-                                "Could not fetch member from pending_id %s",
-                                pending_id_by_name,
-                            )
-                if member is None:
-                    member = await self._find_member_by_username(guild, username_candidate)
+            await self._notify_log_channel(
+                "⚠️ Ko-fi Webhook: Token unbekannt/abgelaufen oder bereits verbraucht. "
+                "Keine Auto-Zuordnung per Username mehr aktiv. Bitte manuell prüfen!"
+                + (
+                    f" (Username-Hinweis: `{username_candidate}`)"
+                    if username_candidate
+                    else ""
+                )
+            )
+            _trace(
+                "kofi_token_not_found",
+                raw_message=raw_message,
+                username_hint=username_candidate,
+                guild_id=getattr(guild, "id", None),
+            )
+            return {"ok": False, "reason": "token_not_found", "raw_message": raw_message}
+
+        member = guild.get_member(pending_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(pending_id)
+            except Exception:
+                log.debug("Could not fetch member from pending_id %s", pending_id)
 
         if member is None:
             await self._notify_log_channel(
-                f"⚠️ Ko-fi Webhook: Kein Nutzer für Token/Message `{raw_message!r}` gefunden. Bitte manuell prüfen!"
+                f"⚠️ Ko-fi Webhook: Kein Nutzer für Token `{token_candidate}` gefunden. Bitte manuell prüfen!"
             )
             _trace(
                 "kofi_member_not_found",
                 raw_message=raw_message,
+                token=token_candidate,
+                pending_id=pending_id,
                 guild_id=getattr(guild, "id", None),
             )
-            return {"ok": False, "reason": "user_not_found", "raw_message": raw_message}
+            return {"ok": False, "reason": "user_not_found", "raw_message": raw_message, "pending_id": pending_id}
 
-        _mark_payment_confirmed(member.id)
+        confirmed = _mark_payment_confirmed(member.id, _format_discord_name(member))
+        if not confirmed:
+            await self._notify_log_channel(
+                f"❌ Ko-fi Webhook: Zahlung für {member.mention} konnte nicht sicher bestätigt werden."
+            )
+            _trace("kofi_payment_confirm_failed", discord_id=member.id, raw_message=raw_message)
+            return {"ok": False, "reason": "payment_confirm_failed", "user_id": member.id}
         _trace("kofi_payment_confirmed", discord_id=member.id, raw_message=raw_message)
 
         await self._notify_log_channel(
@@ -2606,6 +2725,30 @@ class BetaInviteFlow(commands.Cog):
                 discord_id=interaction.user.id,
                 steam_id64=resolved,
             )
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_ERROR,
+                    account_id=account_id,
+                    last_error="Interner Queue-Fehler bei manueller Steam-Freundschaft.",
+                )
+                or record
+            )
+            retry_view = self._build_link_prompt_view(
+                interaction.user,
+                next_handler=self._continue_ticket_after_steam_link,
+            )
+            await self._followup_send(
+                interaction,
+                (
+                    "❌ Wir konnten deine Freundschaft intern gerade nicht vormerken.\n"
+                    "Bitte klicke auf **Weiter**, damit wir den Schritt erneut versuchen.\n"
+                    f"Falls der Fehler bleibt: {BETA_INVITE_SUPPORT_CONTACT}"
+                ),
+                view=retry_view,
+                ephemeral=True,
+            )
+            return
         record = (
             _update_invite(
                 record.id,

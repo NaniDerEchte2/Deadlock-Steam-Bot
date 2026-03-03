@@ -191,6 +191,14 @@ client.on('friendRelationship', (steamId, relationship) => {
           });
         } else {
           log('info', 'Successfully accepted friend request', { steam_id64: sid64 });
+          if (typeof resolveManualFriendRequest === 'function') {
+            const resolved = resolveManualFriendRequest(sid64, 'incoming_accept');
+            if (!resolved) {
+              log('warn', 'Incoming friend request accepted but queue row cleanup failed', {
+                steam_id64: sid64,
+              });
+            }
+          }
         }
       });
     } catch (err) {

@@ -429,6 +429,22 @@ module.exports = (ctx) => {
     }
   }
 
+  function resolveManualFriendRequest(steamId64, reason = 'incoming_accept') {
+    const sid = normalizeSteamId64(steamId64);
+    if (!sid) return false;
+    try {
+      deleteFriendRequestStmt.run(sid);
+      return true;
+    } catch (err) {
+      log('warn', 'Failed to resolve manual Steam friend request row', {
+        steam_id64: sid,
+        reason,
+        error: err && err.message ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
   // ---------- Friend Sync ----------
   async function collectKnownFriendIds() {
     const ids = new Set();
@@ -666,6 +682,7 @@ module.exports = (ctx) => {
     unverifySteamLink,
     requestProfileCardForSid,
     queueFriendRequestForId,
+    resolveManualFriendRequest,
     collectKnownFriendIds,
     resolveCachedPersonaName,
     fetchPersonaNames,
