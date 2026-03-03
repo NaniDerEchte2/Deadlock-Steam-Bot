@@ -3188,9 +3188,20 @@ class BetaInviteFlow(commands.Cog):
             if not friend_ok:
                 stop_anim.set()
                 await self._await_animation_task(anim_task)
+                retry_view = BetaInviteConfirmView(
+                    self,
+                    record.id,
+                    record.discord_id,
+                    record.steam_id64,
+                )
                 await self._edit_original_response(
                     interaction,
-                    content="ℹ️ Wir sind noch keine bestätigten Steam-Freunde. Bitte nimm die Freundschaftsanfrage an und probiere es erneut.",
+                    content=(
+                        "ℹ️ Wir sind noch keine bestätigten Steam-Freunde. "
+                        "Bitte nimm die Freundschaftsanfrage an und klicke danach "
+                        "unten erneut auf **Freundschaft bestätigt**."
+                    ),
+                    view=retry_view,
                 )
                 return
 
