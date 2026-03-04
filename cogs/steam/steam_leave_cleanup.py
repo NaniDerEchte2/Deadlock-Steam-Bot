@@ -16,6 +16,19 @@ from service.config import settings
 log = logging.getLogger(__name__)
 
 
+def _safe_int_setting(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = getattr(settings, name, default)
+    try:
+        value = int(raw)
+    except Exception:
+        value = int(default)
+    return max(minimum, value)
+
+
+STEAM_POLL_MIN_INTERVAL_SEC = _safe_int_setting("steam_poll_min_interval_sec", 86400)
+STEAM_POLL_BATCH_SIZE = min(100, _safe_int_setting("steam_poll_batch_size", 25))
+
+
 class SteamLeaveCleanup(commands.Cog):
     """Bereinigt Steam-Links und Freundschaften, wenn User den Server verlassen."""
 
@@ -24,11 +37,11 @@ class SteamLeaveCleanup(commands.Cog):
         self.tasks = SteamTaskClient(poll_interval=0.5, default_timeout=20.0)
         self._recent: dict[int, float] = {}
         self._last_relationship_probe: float = 0.0
-        # Reconcile safety net: confirmation via member_events tracker + optional grace
-        self._reconcile_suspects: dict[int, float] = {}
-        self._reconcile_grace_seconds: float = 6 * 60 * 60  # 6h
+        self._poll_min_interval_sec = STEAM_POLL_MIN_INTERVAL_SEC
+        self._poll_batch_size = STEAM_POLL_BATCH_SIZE
 
     async def cog_load(self) -> None:
+        self._ensure_poll_state_table()
         self.reconcile_orphaned_links.start()
 
     def cog_unload(self) -> None:
@@ -43,6 +56,109 @@ class SteamLeaveCleanup(commands.Cog):
             cutoff = now - window
             self._recent = {uid: ts for uid, ts in self._recent.items() if ts >= cutoff}
         return bool(last and now - last < window)
+
+    def _ensure_poll_state_table(self) -> None:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS steam_cleanup_poll_state(
+              user_id INTEGER PRIMARY KEY,
+              last_polled_at INTEGER NOT NULL,
+              last_result TEXT NOT NULL,
+              last_error TEXT,
+              miss_count INTEGER NOT NULL DEFAULT 0,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        for alter_stmt in (
+            "ALTER TABLE steam_cleanup_poll_state ADD COLUMN miss_count INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                db.execute(alter_stmt)
+            except Exception as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    log.debug("SteamLeaveCleanup: schema alter skipped/failed: %s", exc)
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_steam_cleanup_poll_state_polled
+              ON steam_cleanup_poll_state(last_polled_at, updated_at)
+            """
+        )
+
+    def _select_poll_candidates(self, *, now_ts: int) -> list[int]:
+        cutoff = int(now_ts) - int(self._poll_min_interval_sec)
+        rows = db.query_all(
+            """
+            SELECT links.user_id
+              FROM (
+                SELECT DISTINCT user_id
+                  FROM steam_links
+                 WHERE user_id != 0
+              ) AS links
+              LEFT JOIN steam_cleanup_poll_state AS state
+                ON state.user_id = links.user_id
+             WHERE COALESCE(state.last_polled_at, 0) <= ?
+             ORDER BY COALESCE(state.last_polled_at, 0) ASC, links.user_id ASC
+             LIMIT ?
+            """,
+            (cutoff, int(self._poll_batch_size)),
+        )
+        out: list[int] = []
+        for row in rows:
+            try:
+                out.append(int(row["user_id"]))
+            except Exception:
+                continue
+        return out
+
+    def _upsert_poll_state(
+        self,
+        user_id: int,
+        *,
+        now_ts: int,
+        result: str,
+        miss_count: int = 0,
+        error: str | None = None,
+    ) -> None:
+        db.execute(
+            """
+            INSERT INTO steam_cleanup_poll_state(
+              user_id, last_polled_at, last_result, last_error, miss_count, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              last_polled_at = excluded.last_polled_at,
+              last_result = excluded.last_result,
+              last_error = excluded.last_error,
+              miss_count = excluded.miss_count,
+              updated_at = excluded.updated_at
+            """,
+            (
+                int(user_id),
+                int(now_ts),
+                str(result),
+                error,
+                max(0, int(miss_count)),
+                int(now_ts),
+            ),
+        )
+
+    def _poll_miss_count(self, user_id: int) -> int:
+        row = db.query_one(
+            """
+            SELECT miss_count
+              FROM steam_cleanup_poll_state
+             WHERE user_id = ?
+             LIMIT 1
+            """,
+            (int(user_id),),
+        )
+        if not row:
+            return 0
+        try:
+            return max(0, int(row["miss_count"] or 0))
+        except Exception:
+            return 0
 
     def _confirmed_left(self, user_id: int, guild_id: int) -> bool:
         """
@@ -81,10 +197,10 @@ class SteamLeaveCleanup(commands.Cog):
         guild_id: int | None,
         display_name: str | None,
         reason: str,
-    ) -> None:
+    ) -> bool:
         try:
             if privacy.is_opted_out(int(user_id)):
-                return
+                return False
 
             rows = db.query_all(
                 """
@@ -98,11 +214,11 @@ class SteamLeaveCleanup(commands.Cog):
                 (int(user_id),),
             )
             if not rows:
-                return
+                return False
 
             steam_ids = [str(r["steam_id"]).strip() for r in rows if r and r["steam_id"]]
             if not steam_ids:
-                return
+                return False
 
             rel_map = await self._fetch_relationships(steam_ids)
 
@@ -171,8 +287,10 @@ class SteamLeaveCleanup(commands.Cog):
                 len(steam_ids),
                 reason,
             )
+            return True
         except Exception as exc:  # noqa: BLE001 - we want full context in logs
             log.warning("Steam cleanup failed for user %s: %s", user_id, exc, exc_info=True)
+            return False
 
     async def _unfriend_all(self, steam_ids: Iterable[str]) -> None:
         unique_ids = sorted({sid for sid in steam_ids if sid})
@@ -216,7 +334,7 @@ class SteamLeaveCleanup(commands.Cog):
         display = getattr(user, "display_name", None) or getattr(user, "name", None)
         await self._handle_leave_event(int(user_id), payload.guild_id, display, "raw_leave")
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=1)
     async def reconcile_orphaned_links(self) -> None:
         await self.bot.wait_until_ready()
         guild_id = settings.guild_id
@@ -227,63 +345,84 @@ class SteamLeaveCleanup(commands.Cog):
             log.debug("SteamLeaveCleanup: Guild %s not found for reconciliation", guild_id)
             return
 
-        rows = db.query_all("SELECT DISTINCT user_id FROM steam_links WHERE user_id != 0")
-        missing: list[int] = []
-        for r in rows:
-            uid = int(r["user_id"])
+        self._ensure_poll_state_table()
+        now_ts = int(time.time())
+        candidates = self._select_poll_candidates(now_ts=now_ts)
+        if not candidates:
+            return
+
+        cleaned = 0
+        for uid in candidates:
+            prior_miss_count = self._poll_miss_count(uid)
             member = guild.get_member(uid)
             if member is not None:
-                # Previously flagged as missing? clear it again
-                self._reconcile_suspects.pop(uid, None)
+                self._upsert_poll_state(uid, now_ts=now_ts, result="present", miss_count=0)
                 continue
+
             try:
                 member = await guild.fetch_member(uid)
             except discord.NotFound:
-                missing.append(uid)
+                confirmed_by_event = self._confirmed_left(uid, guild.id)
+                miss_count = prior_miss_count + 1
+                if confirmed_by_event or miss_count >= 2:
+                    reason = (
+                        "reconcile_event"
+                        if confirmed_by_event
+                        else "reconcile_poll_missing_confirmed"
+                    )
+                    changed = await self._cleanup_user(uid, guild.id, None, reason)
+                    cleaned += int(changed)
+                    self._upsert_poll_state(
+                        uid,
+                        now_ts=now_ts,
+                        result="cleaned" if changed else "confirmed_missing",
+                        miss_count=0,
+                    )
+                else:
+                    self._upsert_poll_state(
+                        uid,
+                        now_ts=now_ts,
+                        result="missing",
+                        miss_count=miss_count,
+                    )
+                continue
             except discord.HTTPException as exc:  # rate limits / temporary failures
                 log.debug("SteamLeaveCleanup: fetch_member failed for %s: %s", uid, exc)
+                self._upsert_poll_state(
+                    uid,
+                    now_ts=now_ts,
+                    result="error",
+                    miss_count=prior_miss_count,
+                    error=str(exc)[:500],
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self._upsert_poll_state(
+                    uid,
+                    now_ts=now_ts,
+                    result="error",
+                    miss_count=prior_miss_count,
+                    error=str(exc)[:500],
+                )
                 continue
             else:
                 if member is None:
-                    missing.append(uid)
+                    self._upsert_poll_state(
+                        uid,
+                        now_ts=now_ts,
+                        result="missing",
+                        miss_count=prior_miss_count + 1,
+                    )
+                else:
+                    self._upsert_poll_state(uid, now_ts=now_ts, result="present", miss_count=0)
 
-        if not missing:
-            return
-
-        now = time.time()
-        confirmed: list[int] = []
-        for uid in missing:
-            # Prefer explicit leave evidence from the tracker
-            if self._confirmed_left(uid, guild.id):
-                confirmed.append(uid)
-                self._reconcile_suspects.pop(uid, None)
-                continue
-
-            # Fallback: grace-based double detection to avoid false positives
-            first_seen = self._reconcile_suspects.get(uid)
-            if first_seen is None:
-                self._reconcile_suspects[uid] = now
-                log.info(
-                    "SteamLeaveCleanup: %s missing (no leave log), deferring cleanup for %.0fh",
-                    uid,
-                    self._reconcile_grace_seconds / 3600,
-                )
-                continue
-            if now - first_seen < self._reconcile_grace_seconds:
-                log.debug(
-                    "SteamLeaveCleanup: %s still missing but within grace (%.0fs left)",
-                    uid,
-                    self._reconcile_grace_seconds - (now - first_seen),
-                )
-                continue
-            confirmed.append(uid)
-            self._reconcile_suspects.pop(uid, None)
-
-        if not confirmed:
-            return
-
-        for uid in confirmed:
-            await self._cleanup_user(uid, guild.id, None, "reconcile")
+        if cleaned:
+            log.info(
+                "SteamLeaveCleanup poll reconcile cleaned %d user(s) [batch=%d, interval=%ds]",
+                cleaned,
+                len(candidates),
+                self._poll_min_interval_sec,
+            )
 
     @reconcile_orphaned_links.before_loop
     async def _wait_ready(self) -> None:
