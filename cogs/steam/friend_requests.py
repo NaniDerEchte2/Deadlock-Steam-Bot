@@ -7,7 +7,14 @@ from collections.abc import Iterable
 
 from service import db
 
+try:
+    from service.config import settings as _settings
+except Exception:  # pragma: no cover - fallback for isolated tests/shims
+    _settings = None
+
 log = logging.getLogger("SteamFriendRequests")
+_OUTGOING_ENV_NAME = "STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED"
+_outgoing_status_logged = False
 
 
 _CREATE_SQL = """
@@ -72,8 +79,39 @@ def _queue_single(steam_id: str, trigger_task: bool = False) -> bool:
         return False
 
 
+def _outgoing_enabled() -> bool:
+    if _settings is not None:
+        try:
+            return bool(getattr(_settings, "steam_outgoing_friend_requests_enabled", False))
+        except Exception:
+            return False
+    return False
+
+
+def _log_outgoing_status_once() -> None:
+    global _outgoing_status_logged
+    if _outgoing_status_logged:
+        return
+    enabled = _outgoing_enabled()
+    source = (
+        "settings.steam_outgoing_friend_requests_enabled"
+        if _settings is not None
+        else f"env:{_OUTGOING_ENV_NAME} (settings unavailable)"
+    )
+    log.info(
+        "Outgoing Steam friend requests are %s (control=%s, env=%s)",
+        "ENABLED" if enabled else "DISABLED",
+        source,
+        _OUTGOING_ENV_NAME,
+    )
+    _outgoing_status_logged = True
+
+
 def queue_friend_requests(steam_ids: Iterable[str]) -> bool:
     """Queue outgoing Steam friend requests for the given SteamIDs."""
+    if not _outgoing_enabled():
+        log.debug("Outgoing Steam friend requests are disabled; skipping queue batch")
+        return False
     if not steam_ids:
         return True
     if not _ensure_table():
@@ -87,9 +125,14 @@ def queue_friend_requests(steam_ids: Iterable[str]) -> bool:
 
 def queue_friend_request(steam_id: str) -> bool:
     """Queue a single outgoing Steam friend request."""
+    if not _outgoing_enabled():
+        log.debug("Outgoing Steam friend requests are disabled; skipping single queue")
+        return False
     if not _ensure_table():
         return False
     return _queue_single(steam_id, trigger_task=True)
 
 
 __all__ = ["queue_friend_request", "queue_friend_requests"]
+
+_log_outgoing_status_once()

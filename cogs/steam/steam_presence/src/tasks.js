@@ -68,6 +68,15 @@ function processNextTask() {
 
       case 'AUTH_SEND_FRIEND_REQUEST': {
         const promise = (async () => {
+          if (!STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED) {
+            return {
+              ok: true,
+              data: {
+                skipped: true,
+                reason: 'outgoing_disabled',
+              },
+            };
+          }
           if (!runtimeState.logged_on) throw new Error('Not logged in');
           const raw = payload?.steam_id ?? payload?.steam_id64;
           const sid = parseSteamID(raw);

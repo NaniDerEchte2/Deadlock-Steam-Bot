@@ -32,6 +32,129 @@ const {
   PROJECT_ROOT,
 } = require('./src/logging');
 
+const SINGLE_INSTANCE_LOCK_PATH = path.join(PROJECT_ROOT, '.steam_presence.lock');
+let singleInstanceLockOwnerPid = null;
+
+function parseLockOwnerPid(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(String(raw));
+    const pid = Number.parseInt(parsed && parsed.pid, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch (_) {
+    const pid = Number.parseInt(String(raw).trim(), 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  }
+}
+
+function isProcessRunning(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    if (err && err.code === 'EPERM') return true;
+    return true;
+  }
+}
+
+function writeSingleInstanceLock(pid) {
+  const payload = JSON.stringify({
+    pid,
+    started_at: new Date().toISOString(),
+    argv: process.argv.slice(1),
+  }) + os.EOL;
+  fs.writeFileSync(SINGLE_INSTANCE_LOCK_PATH, payload, { encoding: 'utf8', flag: 'wx' });
+}
+
+function acquireSingleInstanceLock() {
+  const ownPid = process.pid;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeSingleInstanceLock(ownPid);
+      singleInstanceLockOwnerPid = ownPid;
+      log('info', 'Acquired steam presence lock', {
+        lock_path: SINGLE_INSTANCE_LOCK_PATH,
+        pid: ownPid,
+      });
+      return true;
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') {
+        log('error', 'Failed to create steam presence lock', {
+          lock_path: SINGLE_INSTANCE_LOCK_PATH,
+          error: err && err.message ? err.message : String(err),
+        });
+        return false;
+      }
+
+      let existingPid = null;
+      try {
+        existingPid = parseLockOwnerPid(fs.readFileSync(SINGLE_INSTANCE_LOCK_PATH, 'utf8'));
+      } catch (_) {}
+
+      if (existingPid && existingPid !== ownPid && isProcessRunning(existingPid)) {
+        log('error', 'Another steam presence process is already running - exiting duplicate instance', {
+          lock_path: SINGLE_INSTANCE_LOCK_PATH,
+          existing_pid: existingPid,
+          pid: ownPid,
+        });
+        return false;
+      }
+
+      try {
+        fs.unlinkSync(SINGLE_INSTANCE_LOCK_PATH);
+        log('warn', 'Removed stale steam presence lock file', {
+          lock_path: SINGLE_INSTANCE_LOCK_PATH,
+          stale_pid: existingPid,
+        });
+      } catch (unlinkErr) {
+        log('error', 'Failed to remove stale steam presence lock file', {
+          lock_path: SINGLE_INSTANCE_LOCK_PATH,
+          stale_pid: existingPid,
+          error: unlinkErr && unlinkErr.message ? unlinkErr.message : String(unlinkErr),
+        });
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+function releaseSingleInstanceLock(reason = 'shutdown') {
+  if (singleInstanceLockOwnerPid !== process.pid) return;
+  try {
+    let existingPid = null;
+    try {
+      existingPid = parseLockOwnerPid(fs.readFileSync(SINGLE_INSTANCE_LOCK_PATH, 'utf8'));
+    } catch (_) {}
+
+    if (!existingPid || existingPid === process.pid) {
+      fs.unlinkSync(SINGLE_INSTANCE_LOCK_PATH);
+      log('info', 'Released steam presence lock', {
+        lock_path: SINGLE_INSTANCE_LOCK_PATH,
+        pid: process.pid,
+        reason,
+      });
+    }
+  } catch (err) {
+    if (!err || err.code !== 'ENOENT') {
+      log('warn', 'Failed to release steam presence lock', {
+        lock_path: SINGLE_INSTANCE_LOCK_PATH,
+        pid: process.pid,
+        reason,
+        error: err && err.message ? err.message : String(err),
+      });
+    }
+  } finally {
+    singleInstanceLockOwnerPid = null;
+  }
+}
+
+if (!acquireSingleInstanceLock()) {
+  process.exit(0);
+}
+
 // ---------- SteamID Helper ----------
 let SteamID = null;
 if (SteamUser && SteamUser.SteamID) {
@@ -259,6 +382,14 @@ const FRIEND_SYNC_INTERVAL_MS = Math.max(60000, parseInt(process.env.STEAM_FRIEN
 const FRIEND_REQUEST_BATCH_SIZE = Math.max(1, parseInt(process.env.STEAM_FRIEND_REQUEST_BATCH || '10', 10));
 const FRIEND_REQUEST_RETRY_SECONDS = Math.max(60, parseInt(process.env.STEAM_FRIEND_REQUEST_RETRY_SEC || '900', 10));
 const FRIEND_REQUEST_DAILY_CAP = Math.max(0, parseInt(process.env.STEAM_FRIEND_REQUEST_DAILY_CAP || '10', 10));
+const STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED = ['1', 'true', 'yes', 'on', 'y'].includes(
+  String(process.env.STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED || '0').trim().toLowerCase()
+);
+log('info', 'Outgoing Steam friend requests policy loaded', {
+  enabled: STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
+  env: 'STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED',
+  default_enabled: false,
+});
 const STEAM_TASKS_MAX_ROWS = Math.max(1, parseInt(process.env.STEAM_TASKS_MAX_ROWS || '1000', 10));
 
 const gcOverrideInfo = getGcOverrideInfo();
@@ -418,6 +549,7 @@ const sharedCtx = {
   STEAM_VAULT_REFRESH_TOKEN, STEAM_VAULT_MACHINE_TOKEN, STEAM_TOKEN_VAULT_ENABLED,
   COMMAND_BOT_KEY,
   FRIEND_REQUEST_BATCH_SIZE, FRIEND_REQUEST_RETRY_SECONDS, FRIEND_REQUEST_DAILY_CAP,
+  STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
   STALE_TASK_TIMEOUT_S,
   selectPendingTaskStmt, markTaskRunningStmt, resetTaskPendingStmt, failStaleTasksStmt, finishTaskStmt,
   selectHeroBuildSourceStmt, selectHeroBuildCloneMetaStmt, updateHeroBuildCloneUploadedStmt,
@@ -508,6 +640,7 @@ const taskModule = require('./src/tasks')({
   syncFriendsAndLinks, collectKnownFriendIds, resolveCachedPersonaName,
   queueFriendRequestForId, requestProfileCardForSid,
   STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS, WEB_API_FRIEND_CACHE_TTL_MS,
+  STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
 });
 const { finalizeTaskRun, processNextTask } = taskModule;
 
@@ -602,8 +735,10 @@ function shutdown(code = 0) {
   try { db.close(); } catch (err) {
     log('warn', 'Failed to close database during shutdown', { error: err && err.message ? err.message : String(err) });
   }
+  releaseSingleInstanceLock('shutdown');
   process.exit(code);
 }
+process.on('exit', () => releaseSingleInstanceLock('process_exit'));
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 process.on('uncaughtException', (err) => {

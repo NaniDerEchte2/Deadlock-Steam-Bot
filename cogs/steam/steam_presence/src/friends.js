@@ -9,6 +9,7 @@ const { URL } = require('url');
  *            gcProfileCard, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
  *            WEB_API_FRIEND_CACHE_TTL_MS, FRIEND_REQUEST_BATCH_SIZE,
  *            FRIEND_REQUEST_RETRY_SECONDS, FRIEND_REQUEST_DAILY_CAP,
+ *            STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
  *            selectFriendCheckCacheStmt, upsertFriendCheckCacheStmt,
  *            steamLinksForSyncStmt, upsertPendingFriendRequestStmt,
  *            selectFriendRequestBatchStmt, markFriendRequestSentStmt,
@@ -24,6 +25,7 @@ module.exports = (ctx) => {
     gcProfileCard, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
     WEB_API_FRIEND_CACHE_TTL_MS, FRIEND_REQUEST_BATCH_SIZE,
     FRIEND_REQUEST_RETRY_SECONDS, FRIEND_REQUEST_DAILY_CAP,
+    STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
     selectFriendCheckCacheStmt, upsertFriendCheckCacheStmt,
     steamLinksForSyncStmt, upsertPendingFriendRequestStmt,
     selectFriendRequestBatchStmt, markFriendRequestSentStmt,
@@ -418,6 +420,7 @@ module.exports = (ctx) => {
   }
 
   function queueFriendRequestForId(steamId64) {
+    if (!STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED) return false;
     const sid = normalizeSteamId64(steamId64);
     if (!sid) return false;
     try {
@@ -523,6 +526,9 @@ module.exports = (ctx) => {
   async function processFriendRequestQueue(currentFriends, reason) {
     const outcome = { sent: 0, failed: 0, skipped: 0 };
     if (!runtimeState.logged_on) return outcome;
+    if (!STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED) {
+      return outcome;
+    }
 
     const rows = selectFriendRequestBatchStmt.all(FRIEND_REQUEST_BATCH_SIZE);
     const now = nowSeconds();
