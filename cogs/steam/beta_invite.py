@@ -2123,18 +2123,11 @@ class BetaInviteFlow(commands.Cog):
         except Exception:
             log.debug("Cleanup of pending payments failed", exc_info=True)
 
-        if BETA_MAIN_GUILD_ID:
-            try:
-                guild_obj = discord.Object(id=int(BETA_MAIN_GUILD_ID))
-                asyncio.create_task(self._sync_guild_commands(guild_obj))
-            except Exception as exc:
-                log.warning(
-                    "BetaInvite: Guild-Command-Sync konnte nicht gestartet werden (%s): %s",
-                    BETA_MAIN_GUILD_ID,
-                    exc,
-                )
-        else:
-            log.info("BetaInvite: MAIN_GUILD_ID nicht gesetzt, kein Guild-Sync durchgeführt")
+        # Kein eigener Guild-Sync im cog_load:
+        # Der zentrale Sync in main_bot.setup_hook soll die komplette Commandliste
+        # atomar veröffentlichen. Früher Guild-Syncs aus Einzel-Cogs konnten
+        # bei Rate-Limits/Timeouts Teilmengen (z. B. nur 2 Commands) publizieren.
+        log.info("BetaInvite: Guild-Command-Sync im cog_load deaktiviert (nutzt zentralen Sync).")
         log.info("BetaInvite: Panel-View registriert")
 
     async def cog_unload(self) -> None:

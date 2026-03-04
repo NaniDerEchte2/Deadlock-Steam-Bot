@@ -251,13 +251,9 @@ class SteamFriendsSync(commands.Cog):
 
     async def cog_load(self) -> None:
         self.periodic_sync.start()
-        if settings.guild_id:
-            guild_obj = discord.Object(id=settings.guild_id)
-            # Global-Tree → Guild-Tree verschieben, damit der Command sofort sichtbar ist
-            self.bot.tree.remove_command("sync_steam_friends")
-            self.bot.tree.add_command(self.slash_sync_friends, guild=guild_obj)
-            # Sync nicht blockierend ausführen (Discord Rate Limits können ~60s dauern)
-            asyncio.create_task(self._sync_guild_commands(guild_obj))
+        # Kein eigener Guild-Sync im cog_load:
+        # Der zentrale Sync in main_bot.setup_hook soll die komplette Commandliste
+        # veröffentlichen, um Teilmengen bei Rate-Limits zu vermeiden.
 
     def cog_unload(self) -> None:
         self.periodic_sync.cancel()

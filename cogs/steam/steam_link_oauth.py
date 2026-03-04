@@ -6,6 +6,7 @@ import hmac
 import logging
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -478,11 +479,17 @@ def _ensure_steam_link_ownership_guardrails() -> None:
             WHERE user_id != 0
             """
         )
-    except Exception:
+    except sqlite3.IntegrityError as exc:
         log.warning(
             "Konnte den eindeutigen Steam-Ownership-Index nicht anlegen "
-            "(evtl. historische Duplikate oder SQLite-Einschränkung).",
-            exc_info=True,
+            "(evtl. historische Duplikate): %s",
+            exc,
+        )
+    except Exception as exc:
+        log.warning(
+            "Konnte den eindeutigen Steam-Ownership-Index nicht anlegen "
+            "(SQLite-Einschränkung oder anderer Fehler): %s",
+            exc,
         )
 
     trigger_statements = [
