@@ -23,3 +23,15 @@ Ausgelagerter Steam-/Deadlock-Teil des Discord-Bots. Enthält:
    ```
 
 Secrets/Token gehören **nicht** ins Repo. Der Ordner `.steam-data` ist absichtlich ignoriert.
+
+## Windows-Dienst (NSSM)
+
+Als eigener Dienst einrichten:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ops\install_deadlock_steam_service.ps1
+```
+
+Standard:
+- Service-Name: `DeadlockSteamBot`
+- Anzeigename: `Deadlock Steam Bot`
