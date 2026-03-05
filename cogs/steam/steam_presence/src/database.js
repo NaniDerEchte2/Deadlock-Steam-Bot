@@ -491,7 +491,7 @@ module.exports = (ctx) => {
      WHERE steam_id = ?
   `);
   const selectSteamLinkOwnersForSteamIdStmt = db.prepare(`
-    SELECT DISTINCT user_id
+    SELECT DISTINCT CAST(user_id AS TEXT) AS user_id
       FROM steam_links
      WHERE steam_id = ?
        AND user_id != 0

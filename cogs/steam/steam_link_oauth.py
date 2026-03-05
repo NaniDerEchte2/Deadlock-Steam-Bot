@@ -18,7 +18,11 @@ import discord
 from aiohttp import web
 from discord.ext import commands
 
-from cogs.steam.friend_requests import queue_friend_request, queue_friend_requests
+from cogs.steam.friend_requests import (
+    queue_friend_request,
+    queue_friend_requests,
+    queue_manual_friend_accept,
+)
 from cogs.steam.logging_utils import sanitize_log_value
 from cogs.steam.steam_master import SteamTaskClient
 from service import db
@@ -627,12 +631,29 @@ def _save_steam_link_row(
             }
         raise
     queue_ok = bool(queue_friend_request(target_steam_id))
+    manual_queue_ok = None
     if not queue_ok:
         log.warning(
             "Konnte Steam-Freundschaftsanfrage nicht einreihen (steam_id=%s)",
             _safe_log_repr(target_steam_id),
         )
-    return {"saved": True, "queue_ok": queue_ok, "conflicting_user_id": None}
+        manual_queue_ok = bool(queue_manual_friend_accept(target_steam_id))
+        if manual_queue_ok:
+            log.info(
+                "Manual-Accept-Fallback eingereiht (steam_id=%s)",
+                _safe_log_repr(target_steam_id),
+            )
+        else:
+            log.warning(
+                "Manual-Accept-Fallback fehlgeschlagen (steam_id=%s)",
+                _safe_log_repr(target_steam_id),
+            )
+    return {
+        "saved": True,
+        "queue_ok": queue_ok,
+        "manual_queue_ok": manual_queue_ok,
+        "conflicting_user_id": None,
+    }
 
 
 # ----------------------- Middleware (Top-Level) -------------------------------

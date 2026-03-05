@@ -157,30 +157,8 @@ client.on('friendRelationship', (steamId, relationship) => {
       log('warn', 'Ignoring incoming friend request with invalid SteamID', { steam_id64: sid64Raw || null });
       return;
     }
-    if (!selectPendingFriendRequestForSteamIdStmt || typeof selectPendingFriendRequestForSteamIdStmt.get !== 'function') {
-      log('warn', 'Incoming friend request whitelist check unavailable - refusing auto-accept', { steam_id64: sid64 });
-      return;
-    }
-
-    let pendingRequest = null;
-    try {
-      pendingRequest = selectPendingFriendRequestForSteamIdStmt.get(sid64);
-    } catch (err) {
-      log('warn', 'Failed to verify incoming friend request against DB', {
-        steam_id64: sid64,
-        error: err && err.message ? err.message : String(err),
-      });
-      return;
-    }
-    if (!pendingRequest) {
-      log('warn', 'Ignoring unsolicited incoming friend request', { steam_id64: sid64 });
-      return;
-    }
-
-    log('info', 'Accepting incoming friend request (matched pending queue row)', {
+    log('info', 'Accepting incoming friend request (auto-accept-all enabled)', {
       steam_id64: sid64,
-      requested_at: pendingRequest.requested_at || null,
-      attempts: pendingRequest.attempts || 0,
     });
     try {
       client.addFriend(steamId, (err) => {

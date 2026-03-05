@@ -341,8 +341,9 @@ module.exports = (ctx) => {
       });
       return { steamId: sid, ownerUserId: null };
     }
-    const ownerUserId = Number(ownerRows[0].user_id);
-    if (!Number.isFinite(ownerUserId) || ownerUserId <= 0) {
+    // Keep Discord snowflakes as exact decimal strings (no JS number conversion).
+    const ownerUserId = String(ownerRows[0].user_id || '').trim();
+    if (!/^\d+$/.test(ownerUserId) || ownerUserId === '0') {
       log('warn', 'Skipping ownership-scoped update due to invalid owner user_id', {
         steam_id64: sid,
         action,

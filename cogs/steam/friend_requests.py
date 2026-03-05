@@ -133,6 +133,45 @@ def queue_friend_request(steam_id: str) -> bool:
     return _queue_single(steam_id, trigger_task=True)
 
 
-__all__ = ["queue_friend_request", "queue_friend_requests"]
+def queue_manual_friend_accept(steam_id: str) -> bool:
+    """
+    Allow-list an incoming manual friend request for auto-accept.
+
+    This is used as fallback when the outgoing request queue cannot be used
+    (for example when disabled by policy). The Steam presence bridge will
+    only auto-accept incoming requests that have a pending/manual DB row.
+    """
+    if not _ensure_table():
+        return False
+    sid = str(steam_id or "").strip()
+    if not sid:
+        return False
+    try:
+        db.execute(
+            """
+            INSERT INTO steam_friend_requests(steam_id, status, requested_at, last_attempt, attempts, error)
+            VALUES(?, 'manual', strftime('%s','now'), NULL, 0, NULL)
+            ON CONFLICT(steam_id) DO UPDATE SET
+              status='manual',
+              requested_at=strftime('%s','now'),
+              last_attempt=NULL,
+              attempts=0,
+              error=NULL
+            """,
+            (sid,),
+        )
+        return True
+    except Exception:
+        log.exception(
+            "Failed to queue manual Steam friend-request accept",
+            extra={
+                "steam_id_length": len(sid),
+                "steam_id_valid": bool(re.fullmatch(r"\d{17,20}", sid)),
+            },
+        )
+        return False
+
+
+__all__ = ["queue_friend_request", "queue_friend_requests", "queue_manual_friend_accept"]
 
 _log_outgoing_status_once()
