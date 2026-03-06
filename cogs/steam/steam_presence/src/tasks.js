@@ -6,6 +6,9 @@ module.exports = (context) => {
 // ---------- Task Dispatcher (Promise-fähig) ----------
 let taskInProgress = false;
 const SENSITIVE_PENDING_TASK_TIMEOUT_S = 120;
+let activeTaskId = null;
+let activeTaskStartedAt = 0;
+let lastDeferredStaleCleanupLogAt = 0;
 
 function finalizeTaskRun(task, outcome) {
   // outcome kann sync (Objekt) oder Promise sein
@@ -13,7 +16,13 @@ function finalizeTaskRun(task, outcome) {
     outcome.then(
       (res) => completeTask(task.id, (res && res.ok) ? 'DONE' : 'FAILED', res, res && !res.ok ? res.error : null),
       (err) => completeTask(task.id, 'FAILED', { ok: false, error: err?.message || String(err) }, err?.message || String(err))
-    ).finally(() => { taskInProgress = false; });
+    ).finally(() => {
+      if (activeTaskId === task.id) {
+        activeTaskId = null;
+        activeTaskStartedAt = 0;
+      }
+      taskInProgress = false;
+    });
     return true; // async
   } else {
     const ok = outcome && outcome.ok;
@@ -32,6 +41,8 @@ function processNextTask() {
     const startedAt = nowSeconds();
     task = markTaskRunningStmt.get(startedAt, startedAt);
     if (!task) return;
+    activeTaskId = task.id;
+    activeTaskStartedAt = startedAt;
 
     const payload = safeJsonParse(task.payload);
     log('info', 'Executing steam task', { id: task.id, type: task.type });
@@ -361,18 +372,36 @@ function processNextTask() {
           const gcRetryAttempts = Number.isFinite(Number(gcRetryRaw))
             ? Number(gcRetryRaw)
             : DEFAULT_GC_READY_ATTEMPTS;
-
-          await waitForDeadlockGcReady(gcTimeoutMs, { retryAttempts: gcRetryAttempts });
-
           const timeoutMs = Number.isFinite(Number(requestTimeoutRaw))
             ? Number(requestTimeoutRaw)
             : undefined;
-          const profileCard = await gcProfileCard.fetchPlayerCard({
-            accountId: Number(accountId),
-            timeoutMs,
-            friendAccessHint: payload?.friend_access_hint !== false,
-            devAccessHint: payload?.dev_access_hint,
-          });
+          const timeoutRetriesRaw = payload?.timeout_retry_attempts ?? payload?.timeout_retries;
+          const timeoutRetries = Number.isFinite(Number(timeoutRetriesRaw))
+            ? Number(timeoutRetriesRaw)
+            : undefined;
+
+          let profileCard;
+          if (gcScheduler && typeof gcScheduler.fetchProfileCard === 'function') {
+            profileCard = await gcScheduler.fetchProfileCard({
+              type: 'profile_card_task',
+              accountId: Number(accountId),
+              timeoutMs,
+              friendAccessHint: payload?.friend_access_hint !== false,
+              devAccessHint: payload?.dev_access_hint,
+              requireGcReady: true,
+              gcReadyTimeoutMs: gcTimeoutMs,
+              gcRetryAttempts,
+              timeoutRetries,
+            });
+          } else {
+            await waitForDeadlockGcReady(gcTimeoutMs, { retryAttempts: gcRetryAttempts });
+            profileCard = await gcProfileCard.fetchPlayerCard({
+              accountId: Number(accountId),
+              timeoutMs,
+              friendAccessHint: payload?.friend_access_hint !== false,
+              devAccessHint: payload?.dev_access_hint,
+            });
+          }
 
           const steamId64 = sid && typeof sid.getSteamID64 === 'function'
             ? sid.getSteamID64()
@@ -634,7 +663,13 @@ function processNextTask() {
     log('error', 'Failed to process steam task', { error: err.message });
     if (task && task.id) completeTask(task.id, 'FAILED', { ok:false, error: err.message }, err.message);
   } finally {
-    if (!isAsync) taskInProgress = false;
+    if (!isAsync) {
+      if (task && activeTaskId === task.id) {
+        activeTaskId = null;
+        activeTaskStartedAt = 0;
+      }
+      taskInProgress = false;
+    }
   }
 }
 
@@ -642,20 +677,44 @@ setInterval(() => {
   try {
     // Stale RUNNING Tasks aufräumen (z.B. nach Bridge-Crash)
     const now = nowSeconds();
-    const staleResult = failStaleTasksStmt.run({
-      now,
-      running_timeout_s: STALE_TASK_TIMEOUT_S,
-      running_cutoff: now - STALE_TASK_TIMEOUT_S,
-      pending_timeout_s: SENSITIVE_PENDING_TASK_TIMEOUT_S,
-      pending_cutoff: now - SENSITIVE_PENDING_TASK_TIMEOUT_S,
-    });
-    if (staleResult.changes > 0) {
-      log('warn', 'Cleaned up stale steam tasks', {
-        count: staleResult.changes,
+    const hasActiveTask = activeTaskId !== null && activeTaskStartedAt > 0;
+    const activeTaskAgeS = hasActiveTask ? Math.max(0, now - activeTaskStartedAt) : 0;
+    const shouldDeferStaleCleanup = hasActiveTask && activeTaskAgeS >= STALE_TASK_TIMEOUT_S;
+
+    if (shouldDeferStaleCleanup) {
+      if (now - lastDeferredStaleCleanupLogAt >= 60) {
+        lastDeferredStaleCleanupLogAt = now;
+        log('debug', 'Deferred stale task cleanup for active in-memory task', {
+          active_task_id: activeTaskId,
+          active_task_started_at: activeTaskStartedAt,
+          active_task_age_s: activeTaskAgeS,
+          running_timeout_s: STALE_TASK_TIMEOUT_S,
+        });
+      }
+    } else {
+      const staleResult = failStaleTasksStmt.run({
+        now,
         running_timeout_s: STALE_TASK_TIMEOUT_S,
+        running_cutoff: now - STALE_TASK_TIMEOUT_S,
         pending_timeout_s: SENSITIVE_PENDING_TASK_TIMEOUT_S,
+        pending_cutoff: now - SENSITIVE_PENDING_TASK_TIMEOUT_S,
       });
-      taskInProgress = false; // Erlaubt neuen Task nach Cleanup
+      if (staleResult.changes > 0) {
+        log('warn', 'Cleaned up stale steam tasks', {
+          count: staleResult.changes,
+          running_timeout_s: STALE_TASK_TIMEOUT_S,
+          pending_timeout_s: SENSITIVE_PENDING_TASK_TIMEOUT_S,
+        });
+        // Keep single-task safety: never clear the in-memory lock if a local task is still tracked.
+        if (activeTaskId === null) {
+          taskInProgress = false;
+        } else {
+          log('debug', 'Skipped in-memory task lock reset during stale cleanup', {
+            active_task_id: activeTaskId,
+            active_task_started_at: activeTaskStartedAt || null,
+          });
+        }
+      }
     }
     processNextTask();
   } catch (err) { log('error', 'Task polling loop failed', { error: err.message }); }

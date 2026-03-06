@@ -3,12 +3,13 @@
 /**
  * State — standalone state publishing, task completion
  * Context: { state, runtimeState, log, nowSeconds, COMMAND_BOT_KEY,
+ *            gcScheduler,
  *            upsertStandaloneStateStmt, steamTaskCountsStmt, steamTaskRecentStmt,
  *            finishTaskStmt }
  */
 module.exports = (ctx) => {
   const {
-    state, runtimeState, log, nowSeconds, COMMAND_BOT_KEY,
+    state, runtimeState, log, nowSeconds, COMMAND_BOT_KEY, gcScheduler,
     upsertStandaloneStateStmt, steamTaskCountsStmt, steamTaskRecentStmt,
     finishTaskStmt,
   } = ctx;
@@ -95,6 +96,29 @@ module.exports = (ctx) => {
       }));
     } catch (err) {
       log('warn', 'Failed to collect recent steam tasks', { error: err.message });
+    }
+
+    try {
+      const scheduler = gcScheduler || state.gcScheduler;
+      if (scheduler && typeof scheduler.getTelemetrySnapshot === 'function') {
+        const telemetry = scheduler.getTelemetrySnapshot();
+        snapshot.gc = {
+          queue_length: telemetry.queueLength,
+          timeout_rate: telemetry.timeoutRate,
+          breaker_status: telemetry.breakerStatus,
+          success_rate: telemetry.successRate,
+          ...telemetry,
+        };
+      } else {
+        snapshot.gc = {
+          queue_length: 0,
+          timeout_rate: 0,
+          breaker_status: 'disabled',
+          success_rate: 0,
+        };
+      }
+    } catch (err) {
+      log('warn', 'Failed to collect GC scheduler telemetry', { error: err.message });
     }
 
     return snapshot;

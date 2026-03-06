@@ -6,7 +6,7 @@ const { URL } = require('url');
 /**
  * Friends — WebAPI friend cache, friend requests, DB sync
  * Context: { state, runtimeState, client, log, SteamUser, nowSeconds,
- *            gcProfileCard, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
+ *            gcProfileCard, gcScheduler, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
  *            WEB_API_FRIEND_CACHE_TTL_MS, FRIEND_REQUEST_BATCH_SIZE,
  *            FRIEND_REQUEST_RETRY_SECONDS, FRIEND_REQUEST_DAILY_CAP,
  *            STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
@@ -22,7 +22,7 @@ const { URL } = require('url');
 module.exports = (ctx) => {
   const {
     state, runtimeState, client, log, SteamUser, nowSeconds,
-    gcProfileCard, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
+    gcProfileCard, gcScheduler, STEAM_API_KEY, WEB_API_HTTP_TIMEOUT_MS,
     WEB_API_FRIEND_CACHE_TTL_MS, FRIEND_REQUEST_BATCH_SIZE,
     FRIEND_REQUEST_RETRY_SECONDS, FRIEND_REQUEST_DAILY_CAP,
     STEAM_OUTGOING_FRIEND_REQUESTS_ENABLED,
@@ -40,6 +40,27 @@ module.exports = (ctx) => {
   const FRIEND_CHECK_CACHE_POSITIVE_TTL_MS = 24 * 60 * 60 * 1000;
   const FRIEND_CHECK_CACHE_NEGATIVE_TTL_MS = 2 * 60 * 1000;
   const FRIEND_REQUEST_ERROR_WARN_LIMIT_PER_BATCH = 5;
+  const PROFILE_CARD_THROTTLE_WINDOW_S = 600;
+  const CACHE_CLEANUP_INTERVAL_MS = 60 * 1000;
+
+  function toBoundedInt(value, fallback, minimum, maximum) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
+  }
+
+  const FRIEND_CHECK_CACHE_MAX_ENTRIES = toBoundedInt(
+    process.env.STEAM_FRIEND_CHECK_CACHE_MAX_ENTRIES,
+    20000,
+    1000,
+    200000
+  );
+  const PROFILE_CARD_THROTTLE_MAX_ENTRIES = toBoundedInt(
+    process.env.STEAM_PROFILE_CARD_THROTTLE_MAX_ENTRIES,
+    20000,
+    1000,
+    200000
+  );
 
   // ---------- Utils ----------
   function normalizeSteamId64(value) {
@@ -174,10 +195,49 @@ module.exports = (ctx) => {
     return isFriend ? FRIEND_CHECK_CACHE_POSITIVE_TTL_MS : FRIEND_CHECK_CACHE_NEGATIVE_TTL_MS;
   }
 
+  let lastFriendCheckCacheCleanupAt = 0;
+  function pruneFriendCheckCache(nowMs = Date.now(), force = false) {
+    if (!(state.friendCheckCache instanceof Map)) return;
+    if (!force && state.friendCheckCache.size <= FRIEND_CHECK_CACHE_MAX_ENTRIES) {
+      if (nowMs - lastFriendCheckCacheCleanupAt < CACHE_CLEANUP_INTERVAL_MS) return;
+    }
+
+    let removedExpired = 0;
+    for (const [sid, entry] of state.friendCheckCache.entries()) {
+      const isFriend = Boolean(entry && entry.friend);
+      const ts = Number(entry && entry.ts ? entry.ts : 0);
+      const ttlMs = getFriendCheckTtlMs(isFriend);
+      if (!Number.isFinite(ts) || nowMs - ts >= ttlMs) {
+        state.friendCheckCache.delete(sid);
+        removedExpired += 1;
+      }
+    }
+
+    let removedOverflow = 0;
+    let overflow = state.friendCheckCache.size - FRIEND_CHECK_CACHE_MAX_ENTRIES;
+    while (overflow > 0) {
+      const oldestKey = state.friendCheckCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      state.friendCheckCache.delete(oldestKey);
+      removedOverflow += 1;
+      overflow -= 1;
+    }
+
+    lastFriendCheckCacheCleanupAt = nowMs;
+    if ((removedExpired + removedOverflow) > 0) {
+      log('debug', 'Pruned friend-check cache', {
+        removed_expired: removedExpired,
+        removed_overflow: removedOverflow,
+        size: state.friendCheckCache.size,
+      });
+    }
+  }
+
   function setFriendCheckCacheStatus(steamId64, isFriend, source = 'unknown') {
     const sid = normalizeSteamId64(steamId64);
     if (!sid) return false;
     const nowMs = Date.now();
+    pruneFriendCheckCache(nowMs);
     const friend = Boolean(isFriend);
     state.friendCheckCache.set(sid, { friend, ts: nowMs });
     try {
@@ -198,6 +258,7 @@ module.exports = (ctx) => {
     if (!sid) return false;
 
     const nowMs = Date.now();
+    pruneFriendCheckCache(nowMs);
     const cached = state.friendCheckCache.get(sid);
     if (cached) {
       const ttlMs = getFriendCheckTtlMs(Boolean(cached.friend));
@@ -395,26 +456,70 @@ module.exports = (ctx) => {
   }
 
   const profileCardThrottle = new Map();
+  let lastProfileCardThrottleCleanupAt = 0;
+  function pruneProfileCardThrottle(now = nowSeconds(), force = false) {
+    if (!force && profileCardThrottle.size <= PROFILE_CARD_THROTTLE_MAX_ENTRIES) {
+      if (now - lastProfileCardThrottleCleanupAt < 60) return;
+    }
+
+    let removedExpired = 0;
+    for (const [sid, ts] of profileCardThrottle.entries()) {
+      if (!Number.isFinite(ts) || (now - Number(ts)) >= PROFILE_CARD_THROTTLE_WINDOW_S) {
+        profileCardThrottle.delete(sid);
+        removedExpired += 1;
+      }
+    }
+
+    let removedOverflow = 0;
+    let overflow = profileCardThrottle.size - PROFILE_CARD_THROTTLE_MAX_ENTRIES;
+    while (overflow > 0) {
+      const oldestKey = profileCardThrottle.keys().next().value;
+      if (oldestKey === undefined) break;
+      profileCardThrottle.delete(oldestKey);
+      removedOverflow += 1;
+      overflow -= 1;
+    }
+
+    lastProfileCardThrottleCleanupAt = now;
+    if ((removedExpired + removedOverflow) > 0) {
+      log('debug', 'Pruned profile-card throttle cache', {
+        removed_expired: removedExpired,
+        removed_overflow: removedOverflow,
+        size: profileCardThrottle.size,
+      });
+    }
+  }
 
   function requestProfileCardForSid(steamId64) {
     const sid = normalizeSteamId64(steamId64);
     if (!sid) return;
 
     const now = nowSeconds();
+    pruneProfileCardThrottle(now);
     const last = profileCardThrottle.get(sid) || 0;
-    if (now - last < 600) return;
+    if (now - last < PROFILE_CARD_THROTTLE_WINDOW_S) return;
     profileCardThrottle.set(sid, now);
 
     try {
-      const SteamID = ctx.SteamID;
       const parsed = parseSteamID(sid);
       const accountId = parsed?.accountid ? Number(parsed.accountid) : null;
       if (!Number.isFinite(accountId) || accountId <= 0) return;
 
-      gcProfileCard.fetchPlayerCard({ accountId, timeoutMs: 15000, friendAccessHint: true })
-        .catch((err) => {
-          log('debug', 'ProfileCard prefetch failed', { steam_id64: sid, error: err && err.message ? err.message : String(err) });
-        });
+      const fetchPromise = gcScheduler && typeof gcScheduler.fetchProfileCard === 'function'
+        ? gcScheduler.fetchProfileCard({
+            type: 'profile_card_prefetch',
+            accountId,
+            timeoutMs: 15000,
+            friendAccessHint: true,
+            requireGcReady: true,
+            gcReadyTimeoutMs: 15000,
+            gcRetryAttempts: 1,
+            timeoutRetries: 0,
+          })
+        : gcProfileCard.fetchPlayerCard({ accountId, timeoutMs: 15000, friendAccessHint: true });
+      fetchPromise.catch((err) => {
+        log('debug', 'ProfileCard prefetch failed', { steam_id64: sid, error: err && err.message ? err.message : String(err) });
+      });
     } catch (err) {
       log('debug', 'ProfileCard prefetch parse failed', { steam_id64: sid, error: err && err.message ? err.message : String(err) });
     }

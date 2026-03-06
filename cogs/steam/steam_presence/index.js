@@ -17,6 +17,7 @@ const { StatusAnzeige } = require('./statusanzeige');
 const { DeadlockGcBot } = require('./deadlock_gc_bot');
 const { GcBuildSearch, GC_MSG_FIND_HERO_BUILDS_RESPONSE } = require('./gc_build_search');
 const { GcProfileCard } = require('./gc_profile_card');
+const { createGcScheduler } = require('./src/gc_scheduler');
 const { BuildCatalogManager } = require('./build_catalog_manager');
 const {
   DEADLOCK_GC_PROTOCOL_OVERRIDE_PATH,
@@ -294,7 +295,40 @@ function normalizeToBuffer(value) {
   return null;
 }
 
-let gcTokenRequestInFlight = false;
+const GC_TOKEN_REFRESH_COOLDOWN_MS = Math.max(
+  1000,
+  Number.isFinite(Number(process.env.DEADLOCK_GC_TOKEN_REFRESH_COOLDOWN_MS))
+    ? Number(process.env.DEADLOCK_GC_TOKEN_REFRESH_COOLDOWN_MS)
+    : 30000
+);
+const GC_TOKEN_MIN_COUNT = Math.max(
+  1,
+  Number.isFinite(Number(process.env.DEADLOCK_GC_TOKEN_MIN_COUNT))
+    ? Number(process.env.DEADLOCK_GC_TOKEN_MIN_COUNT)
+    : 2
+);
+const gcTokenState = {
+  refreshCooldownMs: GC_TOKEN_REFRESH_COOLDOWN_MS,
+  minTokenCount: GC_TOKEN_MIN_COUNT,
+  inFlight: false,
+  inFlightPromise: null,
+  lastReason: null,
+  lastRequestAt: 0,
+  lastSuccessAt: 0,
+  lastFailureAt: 0,
+  lastSkipAt: 0,
+  lastError: null,
+  lastKnownTokenCount: 0,
+  totalAttempts: 0,
+  totalSent: 0,
+  totalSkippedCooldown: 0,
+  totalSkippedInFlight: 0,
+};
+function normalizeGcTokenMinCount(value, fallback = GC_TOKEN_MIN_COUNT) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, Number(fallback) || 1);
+  return Math.max(1, Math.floor(parsed));
+}
 function getDeadlockGcTokenCount() {
   if (!client) return 0;
   const tokens = client._gcTokens;
@@ -302,29 +336,68 @@ function getDeadlockGcTokenCount() {
   if (tokens && typeof tokens.length === 'number') return tokens.length;
   return 0;
 }
-async function requestDeadlockGcTokens(reason = 'unspecified') {
+async function requestDeadlockGcTokens(reason = 'unspecified', options = {}) {
   if (!client || typeof client._sendAuthList !== 'function') {
     log('warn', 'Cannot request Deadlock GC tokens - _sendAuthList unavailable', { reason }); return false;
   }
   if (!client.steamID) { log('debug', 'Skipping GC token request - SteamID missing', { reason }); return false; }
-  if (gcTokenRequestInFlight) { log('debug', 'GC token request already in flight', { reason }); return false; }
-  gcTokenRequestInFlight = true;
+  const force = Boolean(options && options.force === true);
+  const minTokenCount = normalizeGcTokenMinCount(options && options.minTokenCount, gcTokenState.minTokenCount);
   const haveTokens = getDeadlockGcTokenCount();
+  const now = Date.now();
+  const cooldownMs = Math.max(1000, Number(gcTokenState.refreshCooldownMs) || GC_TOKEN_REFRESH_COOLDOWN_MS);
+  gcTokenState.lastKnownTokenCount = haveTokens;
+
+  if (gcTokenState.inFlightPromise) {
+    gcTokenState.totalSkippedInFlight += 1;
+    log('debug', 'GC token request already in flight', { reason, haveTokens, minTokenCount });
+    return gcTokenState.inFlightPromise;
+  }
+
+  if (!force && gcTokenState.lastRequestAt > 0 && now - gcTokenState.lastRequestAt < cooldownMs) {
+    const waitMs = Math.max(0, cooldownMs - (now - gcTokenState.lastRequestAt));
+    gcTokenState.totalSkippedCooldown += 1;
+    gcTokenState.lastSkipAt = now;
+    log('debug', 'Skipping GC token request due to cooldown', {
+      reason,
+      haveTokens,
+      minTokenCount,
+      cooldownMs,
+      waitMs,
+    });
+    return false;
+  }
+
+  gcTokenState.inFlight = true;
+  gcTokenState.lastReason = reason;
+  gcTokenState.lastRequestAt = now;
+  gcTokenState.totalAttempts += 1;
+  const requestPromise = (async () => {
   try {
     log('info', 'Requesting Deadlock GC tokens', { reason, haveTokens, appId: DEADLOCK_APP_ID });
     writeDeadlockGcTrace('request_gc_tokens', { reason, haveTokens });
     await client._sendAuthList(DEADLOCK_APP_ID);
     const current = getDeadlockGcTokenCount();
+    gcTokenState.lastKnownTokenCount = current;
+    gcTokenState.lastSuccessAt = Date.now();
+    gcTokenState.lastError = null;
+    gcTokenState.totalSent += 1;
     log('debug', 'GC token request finished', { reason, before: haveTokens, after: current });
     writeDeadlockGcTrace('request_gc_tokens_complete', { reason, before: haveTokens, after: current });
     return true;
   } catch (err) {
+    gcTokenState.lastFailureAt = Date.now();
+    gcTokenState.lastError = err && err.message ? err.message : String(err);
     log('error', 'Failed to request Deadlock GC tokens', { reason, error: err && err.message ? err.message : String(err) });
     writeDeadlockGcTrace('request_gc_tokens_failed', { reason, error: err && err.message ? err.message : String(err) });
     return false;
   } finally {
-    gcTokenRequestInFlight = false;
+    gcTokenState.inFlight = false;
+    gcTokenState.inFlightPromise = null;
   }
+  })();
+  gcTokenState.inFlightPromise = requestPromise;
+  return requestPromise;
 }
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
@@ -462,6 +535,8 @@ const state = {
   lastGcHelloAttemptAt: 0,
   deadlockGcWaiters: [],
   pendingPlaytestInviteResponses: [],
+  gcTokenState,
+  gcScheduler: null,
   webApiFriendCacheIds: null,
   webApiFriendCacheLastLoadedAt: 0,
   webApiFriendCachePromise: null,
@@ -526,6 +601,7 @@ log('info', 'BuildCatalogManager initialisiert');
 const sharedCtx = {
   state, runtimeState, client, log, SteamUser, SteamID,
   deadlockGcBot, gcBuildSearch, gcProfileCard, buildCatalogManager,
+  gcScheduler: null,
   getPersonaName, getWorkingAppId, normalizeToBuffer, convertKeysToCamelCase,
   getDeadlockGcTokenCount, requestDeadlockGcTokens,
   writeDeadlockGcTrace,
@@ -562,6 +638,25 @@ const sharedCtx = {
   deleteFriendRequestStmt, clearFriendFlagStmt,
   selectSteamLinkOwnersForSteamIdStmt, verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
 };
+
+const gcScheduler = createGcScheduler({
+  state,
+  runtimeState,
+  gcProfileCard,
+  requestDeadlockGcTokens,
+  waitForDeadlockGcReady: (...args) => {
+    if (typeof sharedCtx.waitForDeadlockGcReady !== 'function') {
+      throw new Error('waitForDeadlockGcReady unavailable');
+    }
+    return sharedCtx.waitForDeadlockGcReady(...args);
+  },
+  isTimeoutError,
+  sleep,
+  log: (level, message, extra) => log(level, message, extra),
+  trace: writeDeadlockGcTrace,
+});
+state.gcScheduler = gcScheduler;
+sharedCtx.gcScheduler = gcScheduler;
 
 // 1. State — provides scheduleStatePublish (late-bound into sharedCtx for other modules)
 const stateModule = require('./src/state')(sharedCtx);
@@ -632,6 +727,7 @@ const taskModule = require('./src/tasks')({
   buildPlaytestPayloadOverrideFn, playtestMsgConfigs,
   DEFAULT_GC_READY_TIMEOUT_MS, DEFAULT_GC_READY_ATTEMPTS,
   requestDeadlockGcTokens, waitForDeadlockGcReady, sendDeadlockGcHello, ensureDeadlockGamePlaying,
+  gcScheduler,
   sendPlaytestInvite, sendPlaytestInviteOnce, handlePlaytestInviteResponse,
   parseSteamID, isAlreadyFriend, isFriendViaWebApi, getWebApiFriendCacheAgeMs,
   removeFriendship, sendFriendRequest,

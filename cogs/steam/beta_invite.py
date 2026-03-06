@@ -55,6 +55,12 @@ BETA_INVITE_SUPPORT_CONTACT = getattr(
 )
 BETA_MAIN_GUILD_ID = getattr(welcome_base, "MAIN_GUILD_ID", None)
 BETA_INVITE_PANEL_CUSTOM_ID = "betainvite:panel:start"
+BETA_INVITE_INTENT_INVITE_ONLY_CUSTOM_ID = "betainvite:intent:invite_only"
+BETA_INVITE_INTENT_COMMUNITY_CUSTOM_ID = "betainvite:intent:community"
+BETA_INVITE_PAYMENT_CONTINUE_CUSTOM_ID = "betainvite:payment:continue"
+BETA_INVITE_STEAM_LINK_CONTINUE_CUSTOM_ID = "betainvite:link:continue"
+BETA_INVITE_STEAM_LINK_DISABLED_CUSTOM_ID = "betainvite:link:disabled"
+BETA_INVITE_FRIEND_HINT_CONTINUE_CUSTOM_ID = "betainvite:friendhint:continue"
 BETA_INVITE_TICKET_CATEGORY_ID = 1478024871056248975
 BETA_INVITE_TICKET_NAME_PREFIX = "beta-invite"
 KOFI_VERIFICATION_TOKEN = (os.getenv("KOFI_VERIFICATION_TOKEN") or "").strip()
@@ -1298,35 +1304,41 @@ def steam64_to_account_id(steam_id64: str) -> int:
 
 class BetaIntentGateView(discord.ui.View):
     def __init__(self, cog: BetaInviteFlow, requester_id: int) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.cog = cog
         self.requester_id = requester_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        allowed = interaction.user.id == self.requester_id
+        allowed = await self.cog._authorize_ticket_step_interaction(
+            interaction,
+            expected_user_id=self.requester_id,
+            denied_message="Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
+            stale_message="Diese Auswahl ist abgelaufen. Bitte starte `/betainvite` erneut.",
+        )
         self.cog._trace_user_action(
             interaction,
             "intent_gate.interaction_check",
             allowed=allowed,
             requester_id=self.requester_id,
         )
-        if interaction.user.id != self.requester_id:
-            await self.cog._response_send_message(
-                interaction,
-                "Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
-                ephemeral=True,
-            )
-            return False
-        return True
+        return allowed
 
-    @discord.ui.button(label="Nur schnell den Invite abholen", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="Nur schnell den Invite abholen",
+        style=discord.ButtonStyle.primary,
+        custom_id=BETA_INVITE_INTENT_INVITE_ONLY_CUSTOM_ID,
+    )
     async def choose_invite_only(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
         self.cog._trace_user_action(interaction, "intent_gate.choose_invite_only")
         await self.cog.handle_intent_selection(interaction, INTENT_INVITE_ONLY)
 
-    @discord.ui.button(label="Ich will mitspielen/aktiv sein", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="Ich will mitspielen/aktiv sein",
+        style=discord.ButtonStyle.primary,
+        custom_id=BETA_INVITE_INTENT_COMMUNITY_CUSTOM_ID,
+    )
     async def choose_join(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.cog._trace_user_action(interaction, "intent_gate.choose_community")
         await self.cog.handle_intent_selection(interaction, INTENT_COMMUNITY)
@@ -1334,7 +1346,7 @@ class BetaIntentGateView(discord.ui.View):
 
 class InviteOnlyPaymentView(discord.ui.View):
     def __init__(self, cog: BetaInviteFlow, user_id: int, kofi_url: str) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.cog = cog
         self.user_id = int(user_id)
         self.add_item(
@@ -1350,15 +1362,17 @@ class InviteOnlyPaymentView(discord.ui.View):
         label="Ich habe bezahlt – Weiter",
         style=discord.ButtonStyle.success,
         emoji="➡️",
+        custom_id=BETA_INVITE_PAYMENT_CONTINUE_CUSTOM_ID,
     )
     async def paid_continue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.cog._trace_user_action(interaction, "invite_only.payment_continue_clicked")
-        if interaction.user.id != self.user_id:
-            await self.cog._response_send_message(
-                interaction,
-                "Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
-                ephemeral=True,
-            )
+        allowed = await self.cog._authorize_ticket_step_interaction(
+            interaction,
+            expected_user_id=self.user_id,
+            denied_message="Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
+            stale_message="Diese Zahlungsauswahl ist abgelaufen. Bitte starte `/betainvite` erneut.",
+        )
+        if not allowed:
             return
         await self.cog._continue_after_payment(interaction)
 
@@ -1372,7 +1386,7 @@ class BetaInviteLinkPromptView(discord.ui.View):
         *,
         next_handler: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.cog = cog
         self.user_id = user_id
         self.next_handler = next_handler
@@ -1393,6 +1407,7 @@ class BetaInviteLinkPromptView(discord.ui.View):
                     label="Direkt bei Steam anmelden",
                     style=discord.ButtonStyle.secondary,
                     disabled=True,
+                    custom_id=BETA_INVITE_STEAM_LINK_DISABLED_CUSTOM_ID,
                     emoji="🎮",
                     row=0,
                 )
@@ -1402,16 +1417,18 @@ class BetaInviteLinkPromptView(discord.ui.View):
         label="Ich habe mich verknüpft – Weiter",
         style=discord.ButtonStyle.success,
         emoji="➡️",
+        custom_id=BETA_INVITE_STEAM_LINK_CONTINUE_CUSTOM_ID,
         row=1,
     )
     async def next_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.cog._trace_user_action(interaction, "link_prompt.next_clicked")
-        if interaction.user.id != self.user_id:
-            await self.cog._response_send_message(
-                interaction,
-                "Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
-                ephemeral=True,
-            )
+        allowed = await self.cog._authorize_ticket_step_interaction(
+            interaction,
+            expected_user_id=self.user_id,
+            denied_message="Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
+            stale_message="Dieser Steam-Link-Schritt ist abgelaufen. Bitte starte `/betainvite` erneut.",
+        )
+        if not allowed:
             return
 
         # Sofortiges Feedback und Buttons entfernen um Double-Clicks zu verhindern
@@ -1436,7 +1453,7 @@ class BetaInviteLinkPromptView(discord.ui.View):
 
 class BetaInviteFriendHintView(discord.ui.View):
     def __init__(self, cog: BetaInviteFlow, user_id: int) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.cog = cog
         self.user_id = user_id
 
@@ -1444,17 +1461,19 @@ class BetaInviteFriendHintView(discord.ui.View):
         label="Freundschaft bestätigt",
         style=discord.ButtonStyle.success,
         emoji="🤝",
+        custom_id=BETA_INVITE_FRIEND_HINT_CONTINUE_CUSTOM_ID,
     )
     async def confirm_friendship(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
         self.cog._trace_user_action(interaction, "friend_hint.confirm_clicked")
-        if interaction.user.id != self.user_id:
-            await self.cog._response_send_message(
-                interaction,
-                "Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
-                ephemeral=True,
-            )
+        allowed = await self.cog._authorize_ticket_step_interaction(
+            interaction,
+            expected_user_id=self.user_id,
+            denied_message="Nur der ursprüngliche Nutzer kann diese Auswahl treffen.",
+            stale_message="Dieser Freundschafts-Schritt ist abgelaufen. Bitte starte `/betainvite` erneut.",
+        )
+        if not allowed:
             return
 
         try:
@@ -1549,6 +1568,7 @@ class BetaInviteFlow(commands.Cog):
         self.tasks = SteamTaskClient(poll_interval=0.5, default_timeout=30.0)
         self._kofi_webhook_task: asyncio.Task | None = None
         self._kofi_server = None
+        self._kofi_watchdog_task: asyncio.Task | None = None
         self._log_channel_cache: discord.abc.Messageable | None = None
         self._ticket_locks: dict[int, asyncio.Lock] = {}
         _ensure_invite_audit_table()
@@ -1745,6 +1765,49 @@ class BetaInviteFlow(commands.Cog):
             if steam_id:
                 return steam_id
         return None
+
+    def _resolve_ticket_owner_id(self, interaction: discord.Interaction) -> int | None:
+        channel = getattr(interaction, "channel", None)
+        channel_id = getattr(channel, "id", None) or getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            return None
+        try:
+            record = _fetch_ticket_by_channel(int(channel_id))
+        except Exception:
+            return None
+        if record is None:
+            return None
+        if record.status not in BETA_TICKET_REUSABLE_STATUSES:
+            return None
+        return int(record.discord_id)
+
+    async def _authorize_ticket_step_interaction(
+        self,
+        interaction: discord.Interaction,
+        *,
+        expected_user_id: int,
+        denied_message: str,
+        stale_message: str,
+    ) -> bool:
+        allowed_user_id = int(expected_user_id) if int(expected_user_id) > 0 else None
+        if allowed_user_id is None:
+            allowed_user_id = self._resolve_ticket_owner_id(interaction)
+
+        if allowed_user_id is None:
+            await self._response_send_message(
+                interaction,
+                stale_message,
+                ephemeral=True,
+            )
+            return False
+        if int(interaction.user.id) != int(allowed_user_id):
+            await self._response_send_message(
+                interaction,
+                denied_message,
+                ephemeral=True,
+            )
+            return False
+        return True
 
     async def _send_ticket_steam_link_step(
         self,
@@ -2112,6 +2175,18 @@ class BetaInviteFlow(commands.Cog):
 
     async def cog_load(self) -> None:
         self.bot.add_view(BetaInvitePanelView(self))
+        # Persistente Ticket-Step-Views (überleben Cog-Reloads).
+        self.bot.add_view(BetaIntentGateView(self, 0))
+        self.bot.add_view(InviteOnlyPaymentView(self, 0, KOFI_PAYMENT_URL))
+        self.bot.add_view(
+            BetaInviteLinkPromptView(
+                self,
+                0,
+                "https://steamcommunity.com",
+                next_handler=self._continue_ticket_after_steam_link,
+            )
+        )
+        self.bot.add_view(BetaInviteFriendHintView(self, 0))
         # Cleanup expired pending payments (older than 24h)
         try:
             removed = _cleanup_pending_payments()
@@ -2154,7 +2229,36 @@ class BetaInviteFlow(commands.Cog):
 
         self._kofi_server = None
         self._kofi_webhook_task = None
+
+        if self._kofi_watchdog_task and not self._kofi_watchdog_task.done():
+            self._kofi_watchdog_task.cancel()
+        self._kofi_watchdog_task = None
         log.info("BetaInvite: Cog unloaded and server task cleaned up.")
+
+    async def _kofi_webhook_watchdog(self) -> None:
+        """Prüft alle 5 Minuten ob der Ko-fi Webhook-Server läuft und startet ihn ggf. neu."""
+        await asyncio.sleep(60)  # Erst nach 1 Min prüfen – Server braucht Zeit zum Starten
+        while True:
+            try:
+                alive, _ = await asyncio.to_thread(
+                    _probe_kofi_health, KOFI_WEBHOOK_HOST, int(KOFI_WEBHOOK_PORT)
+                )
+                if not alive:
+                    log.warning(
+                        "Ko-fi Watchdog: Server auf %s:%s nicht erreichbar – starte neu.",
+                        KOFI_WEBHOOK_HOST,
+                        KOFI_WEBHOOK_PORT,
+                    )
+                    _trace("kofi_webhook_watchdog_restart", host=KOFI_WEBHOOK_HOST, port=KOFI_WEBHOOK_PORT)
+                    if not self._kofi_webhook_task or self._kofi_webhook_task.done():
+                        self._kofi_webhook_task = asyncio.create_task(
+                            _start_kofi_webhook_server(self)
+                        )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.debug("Ko-fi Watchdog: Fehler beim Health-Check", exc_info=True)
+            await asyncio.sleep(300)  # alle 5 Minuten
 
     async def _sync_guild_commands(self, guild_obj: discord.Object) -> None:
         try:
@@ -3825,6 +3929,10 @@ async def setup(bot: commands.Bot) -> None:
     if not beta_invite_cog._kofi_webhook_task:
         beta_invite_cog._kofi_webhook_task = asyncio.create_task(
             _start_kofi_webhook_server(beta_invite_cog)
+        )
+    if not beta_invite_cog._kofi_watchdog_task:
+        beta_invite_cog._kofi_watchdog_task = asyncio.create_task(
+            beta_invite_cog._kofi_webhook_watchdog()
         )
 
     for command in (
