@@ -61,6 +61,7 @@ BETA_INVITE_PAYMENT_CONTINUE_CUSTOM_ID = "betainvite:payment:continue"
 BETA_INVITE_STEAM_LINK_CONTINUE_CUSTOM_ID = "betainvite:link:continue"
 BETA_INVITE_STEAM_LINK_DISABLED_CUSTOM_ID = "betainvite:link:disabled"
 BETA_INVITE_FRIEND_HINT_CONTINUE_CUSTOM_ID = "betainvite:friendhint:continue"
+BETA_INVITE_RETRY_CUSTOM_ID = "betainvite:error:retry"
 BETA_INVITE_TICKET_CATEGORY_ID = 1478024871056248975
 BETA_INVITE_TICKET_NAME_PREFIX = "beta-invite"
 KOFI_VERIFICATION_TOKEN = (os.getenv("KOFI_VERIFICATION_TOKEN") or "").strip()
@@ -1521,6 +1522,27 @@ class BetaInviteConfirmView(discord.ui.View):
         await self.cog.handle_confirmation(interaction, self.record_id)
 
 
+class BetaInviteRetryView(discord.ui.View):
+    def __init__(self, cog: BetaInviteFlow) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Erneut versuchen",
+        style=discord.ButtonStyle.primary,
+        emoji="🔄",
+        custom_id=BETA_INVITE_RETRY_CUSTOM_ID,
+    )
+    async def retry(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.cog._trace_user_action(interaction, "invite_error.retry_clicked")
+        try:
+            if not interaction.response.is_done():
+                await self.cog._response_defer(interaction, ephemeral=True, thinking=True)
+        except Exception:
+            pass
+        await self.cog._process_invite_request(interaction)
+
+
 class BetaInvitePanelView(discord.ui.View):
     def __init__(self, cog: BetaInviteFlow) -> None:
         super().__init__(timeout=None)
@@ -2175,6 +2197,7 @@ class BetaInviteFlow(commands.Cog):
 
     async def cog_load(self) -> None:
         self.bot.add_view(BetaInvitePanelView(self))
+        self.bot.add_view(BetaInviteRetryView(self))
         # Persistente Ticket-Step-Views (überleben Cog-Reloads).
         self.bot.add_view(BetaIntentGateView(self, 0))
         self.bot.add_view(InviteOnlyPaymentView(self, 0, KOFI_PAYMENT_URL))
@@ -3161,10 +3184,19 @@ class BetaInviteFlow(commands.Cog):
                 last_error=str(error_text),
             )
 
-            err_msg = f"❌ Einladung fehlgeschlagen:\n**{error_text}**\n\nFalls du denkst, dass das ein Fehler ist, melde dich bitte bei hier {BETA_INVITE_SUPPORT_CONTACT}."
+            is_retryable = (
+                not already_has_game
+                and ("timeout" in error_text.lower() or is_timeout)
+            )
+            err_msg = f"❌ Einladung fehlgeschlagen:\n**{error_text}**\n\n"
+            if is_retryable:
+                err_msg += "Der Fehler ist wahrscheinlich vorübergehend. Klicke auf **Erneut versuchen**."
+            else:
+                err_msg += f"Falls du denkst, dass das ein Fehler ist, melde dich bitte bei hier {BETA_INVITE_SUPPORT_CONTACT}."
+            retry_view = BetaInviteRetryView(self) if is_retryable else None
             if isinstance(interaction, discord.Interaction) and interaction.response.is_done():
                 try:
-                    await self._edit_original_response(interaction, content=err_msg, view=None)
+                    await self._edit_original_response(interaction, content=err_msg, view=retry_view)
                 except Exception:
                     await self._followup_send(interaction, err_msg, ephemeral=True)
             else:
