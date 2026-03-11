@@ -86,9 +86,15 @@ class _FakeUser:
 
 
 class _FakeInteraction:
-    def __init__(self, user: _FakeUser) -> None:
+    def __init__(self, user: _FakeUser, channel: Any | None = None) -> None:
         self.user = user
+        self.channel = channel
         self.response = _FakeResponse()
+
+
+class _FakeChannel:
+    def __init__(self, channel_id: int) -> None:
+        self.id = channel_id
 
 
 class _FakeGuild:
@@ -197,6 +203,17 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS steam_links (
+                    user_id INTEGER NOT NULL,
+                    steam_id TEXT NOT NULL,
+                    verified INTEGER DEFAULT 0,
+                    primary_account INTEGER DEFAULT 0,
+                    updated_at INTEGER DEFAULT (strftime('%s','now'))
+                )
+                """
+            )
 
     async def test_invite_only_flow_end_to_end(self) -> None:
         discord_id = 123_456_789
@@ -282,6 +299,97 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await flow.handle_confirmation(interaction, waiting_record.id)
         self.assertEqual(len(invite_send_calls), 1, "Confirm-Step muss Invite-Send auslösen")
 
+    async def test_ticket_manual_friend_flow_restores_persistent_ticket_step(self) -> None:
+        discord_id = 987_654_321
+        ticket_channel_id = 4_242
+        steam_id64 = "76561198000000001"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_links(user_id, steam_id, verified, primary_account, updated_at)
+                VALUES(?, ?, 1, 1, strftime('%s','now'))
+                """,
+                (discord_id, steam_id64),
+            )
+            conn.execute(
+                """
+                INSERT INTO beta_invite_tickets(discord_id, guild_id, channel_id, status)
+                VALUES(?, 1, ?, ?)
+                """,
+                (discord_id, ticket_channel_id, self.mod.BETA_TICKET_STATUS_OPEN),
+            )
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        flow._trace_user_action = lambda *_args, **_kwargs: None
+
+        async def _run_task(*_: Any, **__: Any) -> _FakeOutcome:
+            return _FakeOutcome(
+                ok=True,
+                status="DONE",
+                result={
+                    "data": {
+                        "friend": False,
+                        "relationship_name": "RequestRecipient",
+                        "friend_source": "manual",
+                        "account_id": account_id,
+                    }
+                },
+            )
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+
+        edit_calls: list[dict[str, Any]] = []
+        followup_calls: list[dict[str, Any]] = []
+
+        async def _capture_edit(_interaction: Any, *, content: str | None = None, view: Any | None = None) -> None:
+            edit_calls.append({"content": content, "view": view})
+
+        async def _capture_followup(
+            _interaction: Any,
+            content: str,
+            *,
+            ephemeral: bool = False,
+            view: Any | None = None,
+        ) -> None:
+            followup_calls.append(
+                {"content": content, "view": view, "ephemeral": ephemeral}
+            )
+
+        flow._edit_original_response = _capture_edit
+        flow._followup_send = _capture_followup
+
+        interaction = _FakeInteraction(
+            _FakeUser(discord_id),
+            channel=_FakeChannel(ticket_channel_id),
+        )
+        await flow._process_invite_request(interaction)
+
+        self.assertEqual(
+            len(edit_calls),
+            1,
+            "Ticket-Flow soll den bestehenden Ticket-Schritt aktualisieren statt einen neuen Followup-Step zu erzeugen",
+        )
+        self.assertEqual(len(followup_calls), 0, "Im Ticket-Flow darf kein kurzlebiger Followup-Button mehr entstehen")
+        self.assertIsInstance(edit_calls[0]["view"], self.mod.BetaInviteFriendHintView)
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                "SELECT status, last_error FROM steam_beta_invites WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+            friend_row = conn.execute(
+                "SELECT status FROM steam_friend_requests WHERE steam_id = ?",
+                (steam_id64,),
+            ).fetchone()
+
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_WAITING)
+        self.assertEqual(invite_row["last_error"], "Warte auf manuelle Steam-Freundschaft.")
+        self.assertIsNotNone(friend_row)
+        self.assertEqual(friend_row["status"], "manual")
+
     async def test_kofi_webhook_does_not_auto_match_username(self) -> None:
         discord_id = 555_111
         self.mod._register_pending_payment(discord_id, "Alice")
@@ -303,6 +411,61 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
             any("Keine Auto-Zuordnung per Username mehr aktiv" in msg for msg in notifications),
             "Webhook muss klar auf manuellen Review statt Username-Auto-Match hinweisen",
         )
+
+    def test_resolve_kofi_verification_token_uses_windows_vault_fallback(self) -> None:
+        if self.mod.os.name != "nt":
+            self.skipTest("Windows-only vault fallback")
+
+        env_before = os.environ.pop("KOFI_VERIFICATION_TOKEN", None)
+        keyring_before = sys.modules.get("keyring")
+
+        def _fake_get_password(service: str, user: str) -> str | None:
+            if (service, user) == ("DeadlockBot", "KOFI_VERIFICATION_TOKEN"):
+                return "vault-token-123"
+            return None
+
+        fake_keyring = types.SimpleNamespace(get_password=_fake_get_password)
+        sys.modules["keyring"] = fake_keyring
+        try:
+            token = self.mod._resolve_kofi_verification_token()
+        finally:
+            if env_before is None:
+                os.environ.pop("KOFI_VERIFICATION_TOKEN", None)
+            else:
+                os.environ["KOFI_VERIFICATION_TOKEN"] = env_before
+
+            if keyring_before is None:
+                sys.modules.pop("keyring", None)
+            else:
+                sys.modules["keyring"] = keyring_before
+
+        self.assertEqual(token, "vault-token-123")
+
+    def test_kofi_health_access_filter_suppresses_healthcheck_requests(self) -> None:
+        record = self.mod.logging.makeLogRecord(
+            {
+                "name": "uvicorn.access",
+                "levelno": self.mod.logging.INFO,
+                "msg": '%s - "%s %s HTTP/%s" %d',
+                "args": ("127.0.0.1:12345", "GET", "/kofi-health", "1.1", 200),
+            }
+        )
+
+        self.assertTrue(self.mod._is_kofi_health_access_log(record))
+        self.assertFalse(self.mod._DropKofiHealthAccessLogFilter().filter(record))
+
+    def test_kofi_health_access_filter_keeps_regular_requests(self) -> None:
+        record = self.mod.logging.makeLogRecord(
+            {
+                "name": "uvicorn.access",
+                "levelno": self.mod.logging.INFO,
+                "msg": '%s - "%s %s HTTP/%s" %d',
+                "args": ("127.0.0.1:12345", "POST", "/kofi-webhook", "1.1", 200),
+            }
+        )
+
+        self.assertFalse(self.mod._is_kofi_health_access_log(record))
+        self.assertTrue(self.mod._DropKofiHealthAccessLogFilter().filter(record))
 
 
 if __name__ == "__main__":

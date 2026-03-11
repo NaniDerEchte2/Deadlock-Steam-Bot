@@ -64,7 +64,12 @@ BETA_INVITE_FRIEND_HINT_CONTINUE_CUSTOM_ID = "betainvite:friendhint:continue"
 BETA_INVITE_RETRY_CUSTOM_ID = "betainvite:error:retry"
 BETA_INVITE_TICKET_CATEGORY_ID = 1478024871056248975
 BETA_INVITE_TICKET_NAME_PREFIX = "beta-invite"
-KOFI_VERIFICATION_TOKEN = (os.getenv("KOFI_VERIFICATION_TOKEN") or "").strip()
+KOFI_VERIFICATION_TOKEN_KEY = "KOFI_VERIFICATION_TOKEN"
+KOFI_KEYRING_SERVICE = (
+    os.getenv("KOFI_KEYRING_SERVICE")
+    or os.getenv("STEAM_TOKEN_KEYRING_SERVICE")
+    or "DeadlockBot"
+).strip() or "DeadlockBot"
 
 BETA_TICKET_STATUS_OPEN = "open"
 BETA_TICKET_STATUS_COMPLETED = "completed"
@@ -95,6 +100,37 @@ BETA_INVITE_INTENT_PROMPT_TEXT = (
     "oder nur schnell einen Invite abholen?"
 )
 PENDING_PAYMENT_TTL_SECONDS = 24 * 3600
+
+
+def _resolve_kofi_verification_token() -> str:
+    token = (os.getenv(KOFI_VERIFICATION_TOKEN_KEY) or "").strip()
+    if token:
+        return token
+
+    if os.name != "nt":
+        return ""
+
+    try:
+        import keyring
+    except Exception:
+        return ""
+
+    targets = (
+        (KOFI_KEYRING_SERVICE, KOFI_VERIFICATION_TOKEN_KEY),
+        (
+            f"{KOFI_VERIFICATION_TOKEN_KEY}@{KOFI_KEYRING_SERVICE}",
+            KOFI_VERIFICATION_TOKEN_KEY,
+        ),
+    )
+    for service_name, user_name in targets:
+        try:
+            value = keyring.get_password(service_name, user_name)
+        except Exception:
+            continue
+        candidate = str(value).strip() if value else ""
+        if candidate:
+            return candidate
+    return ""
 
 
 def _make_payment_message(token: str) -> str:
@@ -319,6 +355,20 @@ def _probe_kofi_health(
     if data.get("ok") is True:
         return True, None
     return False, f"Unerwartete Antwort: {data}"
+
+
+def _is_kofi_health_access_log(record: logging.LogRecord) -> bool:
+    args = getattr(record, "args", ())
+    if not isinstance(args, tuple) or len(args) < 3:
+        return False
+    method = str(args[1]).upper()
+    path = str(args[2])
+    return method in {"GET", "HEAD"} and path.startswith("/kofi-health")
+
+
+class _DropKofiHealthAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _is_kofi_health_access_log(record)
 
 
 class _WebhookFollowup:
@@ -2886,10 +2936,31 @@ class BetaInviteFlow(commands.Cog):
             account_id=account_id,
             record_id=record.id,
         )
+        manual_message = _manual_friend_request_workaround_text()
+        if self._is_beta_ticket_interaction(interaction):
+            ticket_view = BetaInviteFriendHintView(self, interaction.user.id)
+            try:
+                await self._edit_original_response(
+                    interaction,
+                    content=manual_message,
+                    view=ticket_view,
+                )
+            except Exception as exc:
+                log.debug(
+                    "Konnte manuellen Freundschafts-Schritt nicht im Ticket aktualisieren: %s",
+                    exc,
+                )
+                await self._followup_send(
+                    interaction,
+                    manual_message,
+                    view=ticket_view,
+                    ephemeral=True,
+                )
+            return
         view = BetaInviteConfirmView(self, record.id, interaction.user.id, resolved)
         await self._followup_send(
             interaction,
-            _manual_friend_request_workaround_text(),
+            manual_message,
             view=view,
             ephemeral=True,
         )
@@ -3812,7 +3883,8 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         log.warning("Ko-fi Webhook deaktiviert (fastapi/uvicorn fehlt)")
         beta_invite._kofi_webhook_task = None
         return
-    if not KOFI_VERIFICATION_TOKEN:
+    verification_token = _resolve_kofi_verification_token()
+    if not verification_token:
         message = "Ko-fi Webhook deaktiviert: KOFI_VERIFICATION_TOKEN fehlt oder ist leer."
         log.error(message)
         await beta_invite._notify_log_channel(message)
@@ -3888,6 +3960,7 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
 
     @app.get("/kofi-health")
     async def kofi_health() -> Mapping[str, Any]:
+        log.debug("Ko-fi health probe served")
         return {"ok": True}
 
     async def kofi_webhook(request: Any) -> JSONResponse:
@@ -3899,7 +3972,7 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         _trace("kofi_webhook_http_received", payload_keys=payload_keys)
 
         token = _extract_kofi_token(payload, request.headers)
-        expected = KOFI_VERIFICATION_TOKEN
+        expected = verification_token
         if not expected:
             _trace("kofi_webhook_missing_verification_token")
             raise HTTPException(status_code=503, detail="Webhook disabled")
@@ -3926,18 +3999,23 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         log_level="info",
         loop="asyncio",
     )
-    server = uvicorn.Server(config=config)
-    beta_invite._kofi_server = server
-    _trace(
-        "kofi_webhook_server_start",
-        host=KOFI_WEBHOOK_HOST,
-        port=KOFI_WEBHOOK_PORT,
-        path=KOFI_WEBHOOK_PATH,
-    )
+    access_logger = logging.getLogger("uvicorn.access")
+    access_filter = _DropKofiHealthAccessLogFilter()
+    access_logger.addFilter(access_filter)
+    server: uvicorn.Server | None = None
     try:
+        server = uvicorn.Server(config=config)
+        beta_invite._kofi_server = server
+        _trace(
+            "kofi_webhook_server_start",
+            host=KOFI_WEBHOOK_HOST,
+            port=KOFI_WEBHOOK_PORT,
+            path=KOFI_WEBHOOK_PATH,
+        )
         await server.serve()
     except asyncio.CancelledError:
-        server.should_exit = True
+        if server is not None:
+            server.should_exit = True
         raise
     except SystemExit:  # pragma: no cover - uvicorn exits with SystemExit on startup errors
         message = (
@@ -3950,6 +4028,7 @@ async def _start_kofi_webhook_server(beta_invite: BetaInviteFlow) -> None:
         log.exception("Ko-fi Webhook-Server gestoppt aufgrund eines Fehlers", exc_info=True)
         await beta_invite._notify_log_channel(f"Ko-fi Webhook-Server gestoppt: {exc}")
     finally:
+        access_logger.removeFilter(access_filter)
         beta_invite._kofi_server = None
         beta_invite._kofi_webhook_task = None
         _trace("kofi_webhook_server_stopped")

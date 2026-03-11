@@ -10,6 +10,7 @@ It provides:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -31,6 +32,10 @@ DISCORD_MENTION_RE = re.compile(r"^<@!?(\d+)>$")
 
 MIN_DISCORD_SNOWFLAKE = 10_000_000_000_000_000
 AUTO_SYNC_INTERVAL_MINUTES = 60.0
+STEAM_TASK_WAIT_GRACE_STATUSES = frozenset({"PENDING", "RUNNING"})
+FRIEND_LIST_TASK_TIMEOUT = 40.0
+FRIEND_LIST_TASK_GRACE_TIMEOUT = 80.0
+STEAM_BRIDGE_HEARTBEAT_STALE_SECONDS = 180
 
 RANK_TIERS: dict[int, str] = {
     0: "Obscurus",
@@ -128,6 +133,10 @@ class SyncStats:
     guilds_targeted: int = 0
 
 
+class SteamBridgeUnavailableError(RuntimeError):
+    """Raised when the Steam bridge cannot serve rank sync tasks right now."""
+
+
 class DeadlockFriendRank(commands.Cog):
     """Steam/Deadlock rank feature backed by GC profile cards."""
 
@@ -169,6 +178,8 @@ class DeadlockFriendRank(commands.Cog):
                     "roles_removed": stats.roles_removed,
                 },
             )
+        except SteamBridgeUnavailableError as exc:
+            log.warning("Deadlock friend-rank auto sync skipped: %s", exc)
         except Exception:
             log.exception("Deadlock friend-rank auto sync failed")
 
@@ -182,6 +193,8 @@ class DeadlockFriendRank(commands.Cog):
             await self._run_friend_rank_sync(trigger="startup")
         except asyncio.CancelledError:
             raise
+        except SteamBridgeUnavailableError as exc:
+            log.warning("Deadlock friend-rank startup sync skipped: %s", exc)
         except Exception:
             log.exception("Deadlock friend-rank startup sync failed")
 
@@ -561,10 +574,100 @@ class DeadlockFriendRank(commands.Cog):
 
         return card, data, outcome
 
+    async def _run_steam_task_with_grace_wait(
+        self,
+        task_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float,
+        grace_timeout: float = 0.0,
+    ) -> tuple[SteamTaskOutcome, float]:
+        task_id = self.tasks.enqueue(task_type, payload)
+        outcome = await self.tasks.wait(task_id, timeout=timeout)
+        total_wait = float(timeout)
+        status = str(outcome.status or "").upper()
+        if not outcome.timed_out or grace_timeout <= 0 or status not in STEAM_TASK_WAIT_GRACE_STATUSES:
+            return outcome, total_wait
+
+        log.warning(
+            "%s task %s still %s after %.1fs, extending wait by %.1fs",
+            task_type,
+            task_id,
+            status.lower(),
+            timeout,
+            grace_timeout,
+        )
+        outcome = await self.tasks.wait(task_id, timeout=grace_timeout)
+        return outcome, total_wait + float(grace_timeout)
+
+    @staticmethod
+    def _extract_bridge_error_message(value: Any) -> str | None:
+        if isinstance(value, dict):
+            value = value.get("message")
+        text = str(value or "").strip()
+        return text or None
+
+    async def _ensure_bridge_ready_for_rank_sync(self) -> None:
+        row = await db.query_one_async(
+            "SELECT heartbeat, payload FROM standalone_bot_state WHERE bot = 'steam' LIMIT 1"
+        )
+        if not row:
+            raise SteamBridgeUnavailableError("Steam bridge state is unavailable")
+
+        heartbeat = self._safe_int(row["heartbeat"])
+        if heartbeat is None:
+            raise SteamBridgeUnavailableError("Steam bridge heartbeat is missing")
+
+        heartbeat_age = max(0, int(time.time()) - heartbeat)
+        if heartbeat_age > STEAM_BRIDGE_HEARTBEAT_STALE_SECONDS:
+            raise SteamBridgeUnavailableError(
+                f"Steam bridge heartbeat is stale ({heartbeat_age}s old)"
+            )
+
+        payload_raw = row["payload"]
+        payload: dict[str, Any] = {}
+        if isinstance(payload_raw, str) and payload_raw.strip():
+            try:
+                decoded = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                log.warning("Failed to decode standalone steam bridge state", exc_info=True)
+            else:
+                if isinstance(decoded, dict):
+                    payload = decoded
+        elif isinstance(payload_raw, dict):
+            payload = payload_raw
+
+        runtime = payload.get("runtime") if isinstance(payload, dict) else {}
+        if not isinstance(runtime, dict):
+            return
+
+        if runtime.get("logged_on"):
+            return
+
+        last_error = self._extract_bridge_error_message(runtime.get("last_error"))
+        if runtime.get("logging_in"):
+            detail = "Steam bridge login is still in progress"
+        elif runtime.get("guard_required"):
+            detail = "Steam bridge is waiting for Steam Guard confirmation"
+        else:
+            detail = "Steam bridge is not logged in"
+
+        if last_error:
+            detail = f"{detail} ({last_error})"
+        raise SteamBridgeUnavailableError(detail)
+
     async def _fetch_bot_friend_ids(self) -> set[str]:
-        outcome = await self.tasks.run("AUTH_GET_FRIENDS_LIST", timeout=40.0)
+        outcome, waited_for = await self._run_steam_task_with_grace_wait(
+            "AUTH_GET_FRIENDS_LIST",
+            timeout=FRIEND_LIST_TASK_TIMEOUT,
+            grace_timeout=FRIEND_LIST_TASK_GRACE_TIMEOUT,
+        )
         if outcome.timed_out:
-            raise RuntimeError(f"AUTH_GET_FRIENDS_LIST timed out (Task #{outcome.task_id})")
+            status = str(outcome.status or "UNKNOWN").upper()
+            raise RuntimeError(
+                f"AUTH_GET_FRIENDS_LIST timed out after {waited_for:.1f}s "
+                f"(Task #{outcome.task_id}, status={status})"
+            )
         if not outcome.ok:
             raise RuntimeError(outcome.error or "AUTH_GET_FRIENDS_LIST fehlgeschlagen")
 
@@ -913,6 +1016,7 @@ class DeadlockFriendRank(commands.Cog):
     async def _run_friend_rank_sync(self, *, trigger: str) -> SyncStats:
         del trigger
         async with self._sync_lock:
+            await self._ensure_bridge_ready_for_rank_sync()
             stats = SyncStats()
             friend_ids = await self._fetch_bot_friend_ids()
             stats.friends_total = len(friend_ids)
