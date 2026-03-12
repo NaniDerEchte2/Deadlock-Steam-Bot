@@ -52,6 +52,8 @@ class _FakeOutcome:
     result: dict[str, Any] | None = None
     status: str = "ok"
     error: str | None = None
+    timed_out: bool = False
+    task_id: int = 1
 
 
 class _FakeSteamTaskClient:
@@ -63,7 +65,37 @@ class _FakeSteamTaskClient:
 
 
 class _FakeBot:
+    def __init__(
+        self,
+        *,
+        guilds: dict[int, Any] | None = None,
+        users: dict[int, Any] | None = None,
+    ) -> None:
+        self._guilds = dict(guilds or {})
+        self._users = dict(users or {})
+
     def add_view(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def wait_until_ready(self) -> None:
+        return None
+
+    def get_guild(self, guild_id: int) -> Any | None:
+        return self._guilds.get(int(guild_id))
+
+    def get_user(self, user_id: int) -> Any | None:
+        return self._users.get(int(user_id))
+
+    async def fetch_user(self, user_id: int) -> Any | None:
+        return self._users.get(int(user_id))
+
+    def get_channel(self, _channel_id: int) -> Any | None:
+        return None
+
+    async def fetch_channel(self, _channel_id: int) -> Any | None:
+        return None
+
+    def get_cog(self, _name: str) -> Any | None:
         return None
 
 
@@ -80,6 +112,7 @@ class _FakeUser:
         self.display_name = name
         self.discriminator = "0"
         self.mention = f"<@{discord_id}>"
+        self.bot = False
 
     async def send(self, *_: Any, **__: Any) -> None:
         return None
@@ -101,6 +134,7 @@ class _FakeGuild:
     def __init__(self, guild_id: int, members: dict[int, _FakeUser]) -> None:
         self.id = guild_id
         self._members = dict(members)
+        self.ban_calls: list[int] = []
 
     def get_member(self, user_id: int) -> _FakeUser | None:
         return self._members.get(int(user_id))
@@ -110,6 +144,22 @@ class _FakeGuild:
         if member is None:
             raise LookupError(f"user_id={user_id} not found")
         return member
+
+    async def ban(self, target: Any, **__: Any) -> None:
+        target_id = getattr(target, "id", target)
+        self.ban_calls.append(int(target_id))
+
+
+class _FakeMember(_FakeUser):
+    def __init__(self, discord_id: int, guild: _FakeGuild, name: str = "Tester") -> None:
+        super().__init__(discord_id, name=name)
+        self.guild = guild
+
+
+class _FakeDiscordApiResponse:
+    status = 404
+    reason = "Not Found"
+    headers: dict[str, str] = {}
 
 
 @unittest.skipUnless(find_spec("discord") is not None, "discord.py is required for this integration test")
@@ -184,6 +234,8 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     friend_requested_at INTEGER,
                     friend_confirmed_at INTEGER,
                     invite_sent_at INTEGER,
+                    scheduled_invite_at INTEGER,
+                    dispatch_attempts INTEGER NOT NULL DEFAULT 0,
                     last_notified_at INTEGER,
                     created_at INTEGER DEFAULT (strftime('%s','now')),
                     updated_at INTEGER DEFAULT (strftime('%s','now'))
@@ -298,6 +350,563 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         interaction = _FakeInteraction(_FakeUser(discord_id))
         await flow.handle_confirmation(interaction, waiting_record.id)
         self.assertEqual(len(invite_send_calls), 1, "Confirm-Step muss Invite-Send auslösen")
+
+    async def test_community_flow_queues_after_confirmed_friendship(self) -> None:
+        discord_id = 123_123_123
+        ticket_channel_id = 3_333
+        steam_id64 = "76561198000000042"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO beta_invite_tickets(discord_id, guild_id, channel_id, status)
+                VALUES(?, 1, ?, ?)
+                """,
+                (discord_id, ticket_channel_id, self.mod.BETA_TICKET_STATUS_OPEN),
+            )
+
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        waiting_record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_WAITING,
+            friend_requested_at=1,
+            last_error=None,
+        )
+        assert waiting_record is not None
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        task_calls: list[str] = []
+        captured_messages: list[str] = []
+        log_messages: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            if task_type == "AUTH_CHECK_FRIENDSHIP":
+                return _FakeOutcome(
+                    ok=True,
+                    status="DONE",
+                    result={
+                        "data": {
+                            "friend": True,
+                            "relationship_name": "Friend",
+                            "account_id": account_id,
+                        }
+                    },
+                )
+            raise AssertionError(f"Unexpected task {task_type}")
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        async def _capture_edit(_interaction: Any, *, content: str | None = None, **__: Any) -> None:
+            if content:
+                captured_messages.append(content)
+
+        async def _notify(message: str) -> None:
+            log_messages.append(message)
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+        flow._response_edit_message = _noop
+        flow._edit_original_response = _capture_edit
+        flow._followup_send = _noop
+        flow._await_animation_task = _noop
+        flow._animate_processing = _noop
+        flow._sync_verified_on_friendship = _noop
+        flow._notify_log_channel = _notify
+
+        interaction = _FakeInteraction(
+            _FakeUser(discord_id, name="CommunityUser"),
+            channel=_FakeChannel(ticket_channel_id),
+        )
+        now_before = int(self.mod.time.time())
+        await flow.handle_confirmation(interaction, waiting_record.id)
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                """
+                SELECT status, scheduled_invite_at, dispatch_attempts, friend_confirmed_at
+                  FROM steam_beta_invites
+                 WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+            ticket_row = conn.execute(
+                "SELECT status FROM beta_invite_tickets WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, ["AUTH_CHECK_FRIENDSHIP"])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_QUEUED_COMMUNITY_DELAY)
+        self.assertEqual(int(invite_row["dispatch_attempts"]), 0)
+        self.assertGreaterEqual(int(invite_row["friend_confirmed_at"]), now_before)
+        self.assertGreaterEqual(
+            int(invite_row["scheduled_invite_at"]),
+            now_before + self.mod.COMMUNITY_INVITE_DELAY_SECONDS - 5,
+        )
+        self.assertLessEqual(
+            int(invite_row["scheduled_invite_at"]),
+            now_before + self.mod.COMMUNITY_INVITE_DELAY_SECONDS + 5,
+        )
+        self.assertIsNotNone(ticket_row)
+        self.assertEqual(ticket_row["status"], self.mod.BETA_TICKET_STATUS_COMPLETED)
+        self.assertTrue(
+            any("15 Minuten bis 2 Stunden" in message for message in captured_messages),
+            "Community-Queue soll sofort die neue Erfolgscopy zeigen",
+        )
+        self.assertTrue(
+            any("BetaInvite queue" in message for message in log_messages),
+            "Queueing muss einen Admin-Logeintrag erzeugen",
+        )
+
+    async def test_dispatcher_claims_due_community_invite_exclusively_across_instances(self) -> None:
+        discord_id = 456_456_456
+        steam_id64 = "76561198000000043"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        member = _FakeUser(discord_id, name="QueuedUser")
+        guild = _FakeGuild(42, members={discord_id: member})
+        flow = self.mod.BetaInviteFlow(_FakeBot(users={discord_id: member}))
+        competing_flow = self.mod.BetaInviteFlow(_FakeBot(users={discord_id: member}))
+        flow._main_guild = lambda: guild
+        competing_flow._main_guild = lambda: guild
+
+        task_calls: list[str] = []
+        status_during_task: list[str] = []
+        log_messages: list[str] = []
+        send_started = asyncio.Event()
+        allow_send_finish = asyncio.Event()
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            with self.mod.db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT status FROM steam_beta_invites WHERE discord_id = ?",
+                    (discord_id,),
+                ).fetchone()
+            status_during_task.append(str(row["status"]))
+            send_started.set()
+            await allow_send_finish.wait()
+            return _FakeOutcome(
+                ok=True,
+                status="DONE",
+                result={"data": {"response": {"ok": True}}},
+            )
+
+        async def _notify(message: str) -> None:
+            log_messages.append(message)
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+        flow._notify_log_channel = _notify
+        competing_flow.tasks = types.SimpleNamespace(run=_run_task)
+        competing_flow._notify_log_channel = _notify
+
+        first_dispatch_task = asyncio.create_task(flow._dispatch_due_community_invites())
+        await asyncio.wait_for(send_started.wait(), timeout=2.0)
+        await competing_flow._dispatch_due_community_invites()
+        allow_send_finish.set()
+        await first_dispatch_task
+        await competing_flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                """
+                SELECT status, dispatch_attempts, invite_sent_at
+                  FROM steam_beta_invites
+                 WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, ["AUTH_SEND_PLAYTEST_INVITE"])
+        self.assertEqual(status_during_task, [self.mod.STATUS_DISPATCHING_COMMUNITY_DELAY])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_INVITE_SENT)
+        self.assertEqual(int(invite_row["dispatch_attempts"]), 1)
+        self.assertIsNotNone(invite_row["invite_sent_at"])
+        self.assertTrue(
+            any("BetaInvite dispatch_success" in message for message in log_messages),
+            "Dispatcher-Erfolg muss geloggt werden",
+        )
+
+    async def test_dispatcher_reclaims_stale_dispatch_claim_after_restart(self) -> None:
+        discord_id = 456_456_999
+        steam_id64 = "76561198000000053"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_DISPATCHING_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=1,
+            last_error="worker crashed",
+        )
+        assert record is not None
+
+        stale_updated_at = (
+            int(self.mod.time.time()) - self.mod.COMMUNITY_DISPATCH_CLAIM_TIMEOUT_SECONDS - 5
+        )
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                "UPDATE steam_beta_invites SET updated_at = ? WHERE id = ?",
+                (stale_updated_at, record.id),
+            )
+
+        member = _FakeUser(discord_id, name="RecoveredUser")
+        guild = _FakeGuild(42, members={discord_id: member})
+        flow = self.mod.BetaInviteFlow(_FakeBot(users={discord_id: member}))
+        flow._main_guild = lambda: guild
+
+        task_calls: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            return _FakeOutcome(
+                ok=True,
+                status="DONE",
+                result={"data": {"response": {"ok": True}}},
+            )
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+
+        await flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                """
+                SELECT status, dispatch_attempts, last_error
+                  FROM steam_beta_invites
+                 WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, ["AUTH_SEND_PLAYTEST_INVITE"])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_INVITE_SENT)
+        self.assertEqual(int(invite_row["dispatch_attempts"]), 2)
+        self.assertIsNone(invite_row["last_error"])
+
+    async def test_dispatcher_marks_error_without_endless_resend(self) -> None:
+        discord_id = 789_789_789
+        steam_id64 = "76561198000000044"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        member = _FakeUser(discord_id, name="FailUser")
+        guild = _FakeGuild(42, members={discord_id: member})
+        flow = self.mod.BetaInviteFlow(_FakeBot(users={discord_id: member}))
+        flow._main_guild = lambda: guild
+
+        task_calls: list[str] = []
+        log_messages: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            return _FakeOutcome(
+                ok=False,
+                status="FAILED",
+                error="bridge failed",
+                result={"error": "bridge failed"},
+            )
+
+        async def _notify(message: str) -> None:
+            log_messages.append(message)
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+        flow._notify_log_channel = _notify
+
+        await flow._dispatch_due_community_invites()
+        await flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                """
+                SELECT status, dispatch_attempts, last_error
+                  FROM steam_beta_invites
+                 WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, ["AUTH_SEND_PLAYTEST_INVITE"])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_ERROR)
+        self.assertEqual(int(invite_row["dispatch_attempts"]), 1)
+        self.assertIn("bridge failed", str(invite_row["last_error"]))
+        self.assertTrue(
+            any("BetaInvite dispatch_error" in message for message in log_messages),
+            "Dispatcher-Fehler muss geloggt werden",
+        )
+
+    async def test_dispatcher_cancels_when_member_events_show_leave_even_if_member_present(self) -> None:
+        discord_id = 741_852_963
+        steam_id64 = "76561198000000046"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=100,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS member_events(
+                    user_id INTEGER NOT NULL,
+                    guild_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO member_events(user_id, guild_id, event_type, timestamp)
+                VALUES(?, ?, 'leave', ?)
+                """,
+                (discord_id, 42, int(self.mod.time.time())),
+            )
+
+        member = _FakeUser(discord_id, name="RejoinedUser")
+        guild = _FakeGuild(42, members={discord_id: member})
+        flow = self.mod.BetaInviteFlow(_FakeBot(users={discord_id: member}))
+        flow._main_guild = lambda: guild
+
+        task_calls: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            return _FakeOutcome(ok=True, status="DONE", result={"ok": True})
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+
+        await flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                "SELECT status, last_error FROM steam_beta_invites WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, [])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_CANCELLED)
+        self.assertIn("member_events", str(invite_row["last_error"]))
+        self.assertEqual(guild.ban_calls, [discord_id])
+
+    async def test_dispatcher_defers_on_membership_lookup_error(self) -> None:
+        discord_id = 654_987_321
+        steam_id64 = "76561198000000047"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        guild = _FakeGuild(42, members={})
+
+        async def _fail_fetch_member(_user_id: int) -> _FakeUser:
+            raise RuntimeError("discord down")
+
+        guild.fetch_member = _fail_fetch_member  # type: ignore[method-assign]
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        flow._main_guild = lambda: guild
+        task_calls: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            return _FakeOutcome(ok=True, status="DONE", result={"ok": True})
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+
+        await flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                "SELECT status, dispatch_attempts FROM steam_beta_invites WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, [])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_QUEUED_COMMUNITY_DELAY)
+        self.assertEqual(int(invite_row["dispatch_attempts"]), 0)
+        self.assertEqual(guild.ban_calls, [])
+
+    async def test_dispatcher_cancels_on_confirmed_discord_not_found(self) -> None:
+        discord_id = 654_987_322
+        steam_id64 = "76561198000000054"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        guild = _FakeGuild(42, members={})
+
+        async def _missing_fetch_member(_user_id: int) -> _FakeUser:
+            raise self.mod.discord.NotFound(_FakeDiscordApiResponse(), "missing")
+
+        guild.fetch_member = _missing_fetch_member  # type: ignore[method-assign]
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        flow._main_guild = lambda: guild
+        task_calls: list[str] = []
+
+        async def _run_task(task_type: str, *_: Any, **__: Any) -> _FakeOutcome:
+            task_calls.append(task_type)
+            return _FakeOutcome(ok=True, status="DONE", result={"ok": True})
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+
+        await flow._dispatch_due_community_invites()
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                "SELECT status, last_error FROM steam_beta_invites WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+
+        self.assertEqual(task_calls, [])
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_CANCELLED)
+        self.assertIn("nicht mehr im Main-Guild", str(invite_row["last_error"]))
+        self.assertEqual(guild.ban_calls, [discord_id])
+
+    async def test_leave_before_dispatch_cancels_queue_and_bans_user(self) -> None:
+        discord_id = 888_111_222
+        steam_id64 = "76561198000000045"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_QUEUED_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) + 3600,
+            dispatch_attempts=0,
+            last_error=None,
+        )
+        assert record is not None
+
+        guild = _FakeGuild(42, members={})
+        member = _FakeMember(discord_id, guild, name="LeavingUser")
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        log_messages: list[str] = []
+
+        async def _notify(message: str) -> None:
+            log_messages.append(message)
+
+        flow._notify_log_channel = _notify
+
+        await flow.on_member_remove(member)
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                """
+                SELECT status, last_error
+                  FROM steam_beta_invites
+                 WHERE discord_id = ?
+                """,
+                (discord_id,),
+            ).fetchone()
+
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_CANCELLED)
+        self.assertIn("verlassen", str(invite_row["last_error"]).lower())
+        self.assertEqual(guild.ban_calls, [discord_id])
+        self.assertTrue(
+            any("BetaInvite cancel" in message for message in log_messages),
+            "Leave-Cancel muss geloggt werden",
+        )
+
+    async def test_leave_during_dispatch_claim_cancels_and_bans_user(self) -> None:
+        discord_id = 888_111_333
+        steam_id64 = "76561198000000055"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        self.mod._persist_intent_once(discord_id, self.mod.INTENT_COMMUNITY)
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_DISPATCHING_COMMUNITY_DELAY,
+            friend_confirmed_at=1,
+            scheduled_invite_at=int(self.mod.time.time()) - 60,
+            dispatch_attempts=1,
+            last_error=None,
+        )
+        assert record is not None
+
+        guild = _FakeGuild(42, members={})
+        member = _FakeMember(discord_id, guild, name="LeavingDispatchUser")
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+
+        await flow.on_member_remove(member)
+
+        with self.mod.db.get_conn() as conn:
+            invite_row = conn.execute(
+                "SELECT status, last_error FROM steam_beta_invites WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchone()
+
+        self.assertIsNotNone(invite_row)
+        self.assertEqual(invite_row["status"], self.mod.STATUS_CANCELLED)
+        self.assertIn("verlassen", str(invite_row["last_error"]).lower())
+        self.assertEqual(guild.ban_calls, [discord_id])
 
     async def test_ticket_manual_friend_flow_restores_persistent_ticket_step(self) -> None:
         discord_id = 987_654_321

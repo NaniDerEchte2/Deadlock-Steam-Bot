@@ -27,9 +27,9 @@ function markLoggedOn(details) {
   }
 
   try {
-    client.setPersona(SteamUser.EPersonaState.Away);
+    client.setPersona(SteamUser.EPersonaState.Invisible);
   } catch (err) {
-    log('warn', 'Failed to set persona away', { error: err.message });
+    log('warn', 'Failed to set persona invisible', { error: err.message });
   }
   ensureDeadlockGamePlaying(true);
   requestDeadlockGcTokens('post-login');

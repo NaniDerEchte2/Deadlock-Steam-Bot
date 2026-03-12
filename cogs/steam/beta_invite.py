@@ -96,9 +96,22 @@ BETA_INVITE_STEAM_LINK_MISSING_TEXT = (
     f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
 )
 BETA_INVITE_INTENT_PROMPT_TEXT = (
-    "Kurze Frage bevor wir loslegen: Willst du hier aktiv mitspielen bzw. aktiv in der Community sein "
-    "oder nur schnell einen Invite abholen?"
+    "Können wir dich künftig in der Community willkommen heißen oder möchtest du dir nur einen Invite sichern?"
 )
+COMMUNITY_DELAY_SUCCESS_TEXT = (
+    "✅ Alles erledigt.\n"
+    "Dein Invite kommt in der Regel in 15 Minuten bis 2 Stunden an, in Ausnahmefällen kann es länger dauern.\n"
+)
+COMMUNITY_INVITE_DELAY_SECONDS = 24 * 3600
+_raw_community_dispatch_interval = os.getenv(
+    "BETA_INVITE_COMMUNITY_DISPATCH_INTERVAL_SECONDS",
+    "60",
+)
+try:
+    COMMUNITY_DISPATCH_INTERVAL_SECONDS = max(15, int(_raw_community_dispatch_interval or "60"))
+except (TypeError, ValueError):
+    COMMUNITY_DISPATCH_INTERVAL_SECONDS = 60
+COMMUNITY_DISPATCH_CLAIM_TIMEOUT_SECONDS = 15 * 60
 PENDING_PAYMENT_TTL_SECONDS = 24 * 3600
 
 
@@ -146,7 +159,7 @@ def _make_payment_message(token: str) -> str:
 
 
 KOFI_PAYMENT_URL = "https://ko-fi.com/deutschedeadlockcommunity"
-_raw_log_channel_id = os.getenv("BETA_INVITE_LOG_CHANNEL_ID", "1234567890")
+_raw_log_channel_id = os.getenv("BETA_INVITE_LOG_CHANNEL_ID", "1374364800817303632")
 try:
     BETA_INVITE_LOG_CHANNEL_ID = int(_raw_log_channel_id)
 except (TypeError, ValueError):
@@ -453,8 +466,15 @@ STEAM64_BASE = 76561197960265728
 
 STATUS_PENDING = "pending"
 STATUS_WAITING = "waiting_friend"
+STATUS_QUEUED_COMMUNITY_DELAY = "queued_community_delay"
+STATUS_DISPATCHING_COMMUNITY_DELAY = "dispatching_community_delay"
+STATUS_CANCELLED = "cancelled"
 STATUS_INVITE_SENT = "invite_sent"
 STATUS_ERROR = "error"
+COMMUNITY_DELAY_ACTIVE_STATUSES = {
+    STATUS_QUEUED_COMMUNITY_DELAY,
+    STATUS_DISPATCHING_COMMUNITY_DELAY,
+}
 
 SERVER_LEAVE_BAN_REASON = "Ausschluss aus der Community wegen Leaven des Servers"
 
@@ -464,6 +484,8 @@ _ALLOWED_UPDATE_FIELDS = {
     "friend_requested_at",
     "friend_confirmed_at",
     "invite_sent_at",
+    "scheduled_invite_at",
+    "dispatch_attempts",
     "last_notified_at",
     "account_id",
 }
@@ -503,6 +525,71 @@ def _ensure_beta_invite_tickets_table() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_beta_invite_tickets_channel ON beta_invite_tickets(channel_id)"
+        )
+
+
+def _ensure_beta_invite_intent_table() -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS beta_invite_intent (
+                discord_id INTEGER PRIMARY KEY,
+                intent TEXT NOT NULL,
+                decided_at INTEGER NOT NULL,
+                locked INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+
+
+def _ensure_steam_beta_invites_table() -> None:
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS steam_beta_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER NOT NULL UNIQUE,
+                steam_id64 TEXT NOT NULL,
+                account_id INTEGER,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                friend_requested_at INTEGER,
+                friend_confirmed_at INTEGER,
+                invite_sent_at INTEGER,
+                scheduled_invite_at INTEGER,
+                dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+                last_notified_at INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s','now')),
+                updated_at INTEGER DEFAULT (strftime('%s','now'))
+            )
+            """
+        )
+        migration_steps = [
+            (
+                "ALTER TABLE steam_beta_invites ADD COLUMN scheduled_invite_at INTEGER",
+                "scheduled_invite_at",
+            ),
+            (
+                "ALTER TABLE steam_beta_invites ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0",
+                "dispatch_attempts",
+            ),
+        ]
+        for statement, column_name in migration_steps:
+            try:
+                conn.execute(statement)
+            except Exception as exc:
+                if "duplicate column name" in str(exc).lower():
+                    continue
+                log.exception(
+                    "Migration fehlgeschlagen: steam_beta_invites.%s konnte nicht angelegt werden",
+                    column_name,
+                )
+                raise
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_steam_beta_invites_status_schedule
+              ON steam_beta_invites(status, scheduled_invite_at, updated_at)
+            """
         )
 
 
@@ -699,13 +786,26 @@ def _log_invite_grant(
         )
 
 
-def _format_invite_sent_utc(invite_sent_at: int | None) -> str | None:
-    if not invite_sent_at:
+def _format_timestamp_utc(timestamp: int | None) -> str | None:
+    if not timestamp:
         return None
     try:
-        return datetime.fromtimestamp(int(invite_sent_at), tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return datetime.fromtimestamp(int(timestamp), tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         return None
+
+
+def _format_invite_sent_utc(invite_sent_at: int | None) -> str | None:
+    return _format_timestamp_utc(invite_sent_at)
+
+
+def _build_community_delay_success_message(steam_id64: str) -> str:
+    profile_url = f"https://steamcommunity.com/profiles/{steam_id64}"
+    return (
+        f"{COMMUNITY_DELAY_SUCCESS_TEXT}\n"
+        f"Steam-Account: {profile_url}\n"
+        "Wenn du den Server vorher verlässt, wird der Invite storniert."
+    )
 
 
 def _build_already_invited_message(record: BetaInviteRecord, steam_id64: str) -> str:
@@ -1115,9 +1215,18 @@ class BetaInviteRecord:
     friend_requested_at: int | None
     friend_confirmed_at: int | None
     invite_sent_at: int | None
+    scheduled_invite_at: int | None
+    dispatch_attempts: int
     last_notified_at: int | None
     created_at: int | None
     updated_at: int | None
+
+
+@dataclass(slots=True)
+class GuildMemberLookupResult:
+    member: discord.Member | None
+    confirmed_absent: bool
+    error: str | None = None
 
 
 def _row_to_record(row: db.sqlite3.Row | None) -> BetaInviteRecord | None:  # type: ignore[attr-defined]
@@ -1137,6 +1246,12 @@ def _row_to_record(row: db.sqlite3.Row | None) -> BetaInviteRecord | None:  # ty
         if row["friend_confirmed_at"] is not None
         else None,
         invite_sent_at=int(row["invite_sent_at"]) if row["invite_sent_at"] is not None else None,
+        scheduled_invite_at=int(row["scheduled_invite_at"])
+        if row["scheduled_invite_at"] is not None
+        else None,
+        dispatch_attempts=int(row["dispatch_attempts"] or 0)
+        if row["dispatch_attempts"] is not None
+        else 0,
         last_notified_at=int(row["last_notified_at"])
         if row["last_notified_at"] is not None
         else None,
@@ -1161,6 +1276,167 @@ def _fetch_invite_by_id(record_id: int) -> BetaInviteRecord | None:
             (int(record_id),),
         ).fetchone()
     return _row_to_record(row)
+
+
+def _fetch_due_community_delay_invites(
+    now_ts: int,
+    *,
+    limit: int = 10,
+) -> list[BetaInviteRecord]:
+    stale_claim_before_ts = int(now_ts) - COMMUNITY_DISPATCH_CLAIM_TIMEOUT_SECONDS
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+              FROM steam_beta_invites
+             WHERE (
+                       status = ?
+                   AND scheduled_invite_at IS NOT NULL
+                   AND scheduled_invite_at <= ?
+             )
+                OR (
+                       status = ?
+                   AND scheduled_invite_at IS NOT NULL
+                   AND scheduled_invite_at <= ?
+                   AND COALESCE(updated_at, 0) <= ?
+             )
+             ORDER BY scheduled_invite_at ASC, id ASC
+             LIMIT ?
+            """,
+            (
+                STATUS_QUEUED_COMMUNITY_DELAY,
+                int(now_ts),
+                STATUS_DISPATCHING_COMMUNITY_DELAY,
+                int(now_ts),
+                int(stale_claim_before_ts),
+                max(1, int(limit)),
+            ),
+        ).fetchall()
+    return [record for row in rows if (record := _row_to_record(row)) is not None]
+
+
+def _claim_due_community_delay_invite(
+    record_id: int,
+    *,
+    now_ts: int,
+) -> BetaInviteRecord | None:
+    stale_claim_before_ts = int(now_ts) - COMMUNITY_DISPATCH_CLAIM_TIMEOUT_SECONDS
+    with db.get_conn() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE steam_beta_invites
+               SET status = ?,
+                   last_error = NULL,
+                   updated_at = strftime('%s','now')
+             WHERE id = ?
+               AND scheduled_invite_at IS NOT NULL
+               AND scheduled_invite_at <= ?
+               AND (
+                       status = ?
+                    OR (
+                           status = ?
+                       AND COALESCE(updated_at, 0) <= ?
+                    )
+               )
+            """,
+            (
+                STATUS_DISPATCHING_COMMUNITY_DELAY,
+                int(record_id),
+                int(now_ts),
+                STATUS_QUEUED_COMMUNITY_DELAY,
+                STATUS_DISPATCHING_COMMUNITY_DELAY,
+                int(stale_claim_before_ts),
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM steam_beta_invites WHERE id = ?",
+            (int(record_id),),
+        ).fetchone()
+    return _row_to_record(row)
+
+
+def _release_community_delay_invite_claim(
+    record_id: int,
+    *,
+    last_error: str | None = None,
+) -> BetaInviteRecord | None:
+    with db.get_conn() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE steam_beta_invites
+               SET status = ?,
+                   last_error = ?,
+                   updated_at = strftime('%s','now')
+             WHERE id = ?
+               AND status = ?
+            """,
+            (
+                STATUS_QUEUED_COMMUNITY_DELAY,
+                last_error,
+                int(record_id),
+                STATUS_DISPATCHING_COMMUNITY_DELAY,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM steam_beta_invites WHERE id = ?",
+            (int(record_id),),
+        ).fetchone()
+    return _row_to_record(row)
+
+
+def _fetch_active_community_delay_claim(record_id: int) -> BetaInviteRecord | None:
+    record = _fetch_invite_by_id(record_id)
+    if record is None or record.status != STATUS_DISPATCHING_COMMUNITY_DELAY:
+        return None
+    return record
+
+
+def _normalize_member_event_timestamp(value: Any) -> int | None:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10**12:
+        return timestamp // 1000
+    return timestamp
+
+
+def _has_member_left_since(
+    discord_id: int,
+    guild_id: int,
+    *,
+    since_ts: int | None,
+) -> bool | None:
+    cutoff = max(0, int(since_ts or 0))
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT event_type, timestamp
+                  FROM member_events
+                 WHERE user_id = ? AND guild_id = ?
+                   AND LOWER(event_type) IN ('leave', 'ban')
+                 ORDER BY timestamp DESC
+                 LIMIT 1
+                """,
+                (int(discord_id), int(guild_id)),
+            ).fetchone()
+    except Exception as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        log.debug("BetaInvite: member_events lookup failed", exc_info=True)
+        return None
+
+    if not row:
+        return False
+    event_timestamp = _normalize_member_event_timestamp(row["timestamp"])
+    if event_timestamp is None:
+        return False
+    return event_timestamp >= cutoff
 
 
 def _format_gc_response_error(response: Mapping[str, Any]) -> str | None:
@@ -1214,6 +1490,8 @@ def _create_or_reset_invite(
               friend_requested_at = NULL,
               friend_confirmed_at = NULL,
               invite_sent_at = NULL,
+              scheduled_invite_at = NULL,
+              dispatch_attempts = 0,
               last_notified_at = NULL,
               updated_at = strftime('%s','now')
             """,
@@ -1245,6 +1523,8 @@ def _update_invite(record_id: int, **fields) -> BetaInviteRecord | None:
         friend_requested_set, friend_requested_val = _flag_and_value("friend_requested_at")
         friend_confirmed_set, friend_confirmed_val = _flag_and_value("friend_confirmed_at")
         invite_sent_set, invite_sent_val = _flag_and_value("invite_sent_at")
+        scheduled_invite_set, scheduled_invite_val = _flag_and_value("scheduled_invite_at")
+        dispatch_attempts_set, dispatch_attempts_val = _flag_and_value("dispatch_attempts")
         last_notified_set, last_notified_val = _flag_and_value("last_notified_at")
         account_id_set, account_id_val = _flag_and_value("account_id")
 
@@ -1256,6 +1536,8 @@ def _update_invite(record_id: int, **fields) -> BetaInviteRecord | None:
                    friend_requested_at = CASE WHEN ? THEN ? ELSE friend_requested_at END,
                    friend_confirmed_at = CASE WHEN ? THEN ? ELSE friend_confirmed_at END,
                    invite_sent_at = CASE WHEN ? THEN ? ELSE invite_sent_at END,
+                   scheduled_invite_at = CASE WHEN ? THEN ? ELSE scheduled_invite_at END,
+                   dispatch_attempts = CASE WHEN ? THEN ? ELSE dispatch_attempts END,
                    last_notified_at = CASE WHEN ? THEN ? ELSE last_notified_at END,
                    account_id = CASE WHEN ? THEN ? ELSE account_id END,
                    updated_at = strftime('%s','now')
@@ -1272,6 +1554,10 @@ def _update_invite(record_id: int, **fields) -> BetaInviteRecord | None:
                 friend_confirmed_val,
                 invite_sent_set,
                 invite_sent_val,
+                scheduled_invite_set,
+                scheduled_invite_val,
+                dispatch_attempts_set,
+                dispatch_attempts_val,
                 last_notified_set,
                 last_notified_val,
                 account_id_set,
@@ -1375,7 +1661,16 @@ class BetaIntentGateView(discord.ui.View):
         return allowed
 
     @discord.ui.button(
-        label="Nur schnell den Invite abholen",
+        label="Ich will Teil der Community werden",
+        style=discord.ButtonStyle.primary,
+        custom_id=BETA_INVITE_INTENT_COMMUNITY_CUSTOM_ID,
+    )
+    async def choose_join(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.cog._trace_user_action(interaction, "intent_gate.choose_community")
+        await self.cog.handle_intent_selection(interaction, INTENT_COMMUNITY)
+
+    @discord.ui.button(
+        label="Nur den Invite mitnehmen",
         style=discord.ButtonStyle.primary,
         custom_id=BETA_INVITE_INTENT_INVITE_ONLY_CUSTOM_ID,
     )
@@ -1384,15 +1679,6 @@ class BetaIntentGateView(discord.ui.View):
     ) -> None:
         self.cog._trace_user_action(interaction, "intent_gate.choose_invite_only")
         await self.cog.handle_intent_selection(interaction, INTENT_INVITE_ONLY)
-
-    @discord.ui.button(
-        label="Ich will mitspielen/aktiv sein",
-        style=discord.ButtonStyle.primary,
-        custom_id=BETA_INVITE_INTENT_COMMUNITY_CUSTOM_ID,
-    )
-    async def choose_join(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        self.cog._trace_user_action(interaction, "intent_gate.choose_community")
-        await self.cog.handle_intent_selection(interaction, INTENT_COMMUNITY)
 
 
 class InviteOnlyPaymentView(discord.ui.View):
@@ -1641,10 +1927,14 @@ class BetaInviteFlow(commands.Cog):
         self._kofi_webhook_task: asyncio.Task | None = None
         self._kofi_server = None
         self._kofi_watchdog_task: asyncio.Task | None = None
+        self._community_dispatcher_task: asyncio.Task | None = None
         self._log_channel_cache: discord.abc.Messageable | None = None
         self._ticket_locks: dict[int, asyncio.Lock] = {}
+        self._community_dispatch_lock = asyncio.Lock()
         _ensure_invite_audit_table()
         _ensure_beta_invite_tickets_table()
+        _ensure_beta_invite_intent_table()
+        _ensure_steam_beta_invites_table()
         _ensure_pending_payments_table()
 
     def _trace_user_action(
@@ -2276,6 +2566,10 @@ class BetaInviteFlow(commands.Cog):
         # atomar veröffentlichen. Früher Guild-Syncs aus Einzel-Cogs konnten
         # bei Rate-Limits/Timeouts Teilmengen (z. B. nur 2 Commands) publizieren.
         log.info("BetaInvite: Guild-Command-Sync im cog_load deaktiviert (nutzt zentralen Sync).")
+        if not self._community_dispatcher_task or self._community_dispatcher_task.done():
+            self._community_dispatcher_task = asyncio.create_task(
+                self._community_dispatcher_loop()
+            )
         log.info("BetaInvite: Panel-View registriert")
 
     async def cog_unload(self) -> None:
@@ -2306,7 +2600,151 @@ class BetaInviteFlow(commands.Cog):
         if self._kofi_watchdog_task and not self._kofi_watchdog_task.done():
             self._kofi_watchdog_task.cancel()
         self._kofi_watchdog_task = None
+
+        if self._community_dispatcher_task and not self._community_dispatcher_task.done():
+            self._community_dispatcher_task.cancel()
+        self._community_dispatcher_task = None
         log.info("BetaInvite: Cog unloaded and server task cleaned up.")
+
+    async def _community_dispatcher_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await self._dispatch_due_community_invites()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("BetaInvite: Community-Dispatcher fehlgeschlagen")
+            await asyncio.sleep(COMMUNITY_DISPATCH_INTERVAL_SECONDS)
+
+    async def _dispatch_due_community_invites(self) -> None:
+        guild = self._main_guild()
+        if guild is None:
+            return
+        if self._community_dispatch_lock.locked():
+            return
+
+        async with self._community_dispatch_lock:
+            due_records = _fetch_due_community_delay_invites(int(time.time()))
+            for record in due_records:
+                await self._dispatch_single_due_community_invite(guild, record)
+
+    async def _dispatch_single_due_community_invite(
+        self,
+        guild: discord.Guild,
+        record: BetaInviteRecord,
+    ) -> None:
+        current = _claim_due_community_delay_invite(record.id, now_ts=int(time.time()))
+        if current is None:
+            return
+
+        intent_record = _get_intent_record(current.discord_id)
+        intent = intent_record.intent if intent_record is not None else None
+        if intent != INTENT_COMMUNITY:
+            updated = (
+                _update_invite(
+                    current.id,
+                    status=STATUS_ERROR,
+                    last_error="Queue-Dispatch ohne gültigen Community-Intent entdeckt.",
+                    dispatch_attempts=current.dispatch_attempts + 1,
+                )
+                or current
+            )
+            await self._log_admin_invite_event(
+                "dispatch_error",
+                record=updated,
+                intent=intent,
+                old_status=current.status,
+                new_status=updated.status,
+                error=updated.last_error,
+                task_result={"reason": "intent_mismatch"},
+            )
+            return
+
+        leave_since_queue = _has_member_left_since(
+            current.discord_id,
+            guild.id,
+            since_ts=current.friend_confirmed_at or current.created_at,
+        )
+        if leave_since_queue:
+            cancel_reason = "Nutzer hat laut member_events den Server vor dem geplanten Versand verlassen."
+            updated = (
+                _update_invite(
+                    current.id,
+                    status=STATUS_CANCELLED,
+                    last_error=cancel_reason,
+                )
+                or current
+            )
+            ban_result = await self._ban_guild_user(
+                guild,
+                current.discord_id,
+                reason=SERVER_LEAVE_BAN_REASON,
+            )
+            await self._log_admin_invite_event(
+                "cancel",
+                record=updated,
+                intent=intent,
+                old_status=current.status,
+                new_status=updated.status,
+                error=cancel_reason,
+                task_result={"ban_result": ban_result, "source": "member_events"},
+            )
+            return
+
+        member_lookup = await self._fetch_guild_member(guild, current.discord_id)
+        member = member_lookup.member
+        if member is None:
+            if not member_lookup.confirmed_absent:
+                _release_community_delay_invite_claim(
+                    current.id,
+                    last_error=member_lookup.error,
+                )
+                log.warning(
+                    "BetaInvite: Membership-Check für %s vertagt: %s",
+                    current.discord_id,
+                    member_lookup.error or "unknown_error",
+                )
+                _trace(
+                    "community_dispatch_member_check_deferred",
+                    discord_id=current.discord_id,
+                    steam_id64=current.steam_id64,
+                    error=member_lookup.error,
+                )
+                return
+            cancel_reason = "Nutzer war vor dem geplanten Versand nicht mehr im Main-Guild."
+            updated = (
+                _update_invite(
+                    current.id,
+                    status=STATUS_CANCELLED,
+                    last_error=cancel_reason,
+                )
+                or current
+            )
+            ban_result = await self._ban_guild_user(
+                guild,
+                current.discord_id,
+                reason=SERVER_LEAVE_BAN_REASON,
+            )
+            await self._log_admin_invite_event(
+                "cancel",
+                record=updated,
+                intent=intent,
+                old_status=current.status,
+                new_status=updated.status,
+                error=cancel_reason,
+                task_result={"ban_result": ban_result},
+            )
+            return
+
+        await self._send_invite_after_friend(
+            None,
+            current,
+            account_id_hint=current.account_id,
+            bypass_community_delay=True,
+            dispatch_source="community_dispatcher",
+            discord_name_override=_format_discord_name(member),
+        )
 
     async def _kofi_webhook_watchdog(self) -> None:
         """Prüft alle 5 Minuten ob der Ko-fi Webhook-Server läuft und startet ihn ggf. neu."""
@@ -2400,6 +2838,125 @@ class BetaInviteFlow(commands.Cog):
                 error_type=type(exc).__name__,
             )
             log.debug("Senden an BetaInvite-Log-Channel fehlgeschlagen", exc_info=True)
+
+    @staticmethod
+    def _serialize_admin_log_value(value: Any, *, max_len: int = 1500) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                text = str(value)
+        preview = _preview_text(text, max_len=max_len)
+        return preview or "-"
+
+    async def _resolve_discord_name(self, discord_id: int, fallback: str | None = None) -> str:
+        if fallback:
+            return fallback
+
+        guild = self._main_guild()
+        if guild is not None:
+            member = guild.get_member(int(discord_id))
+            if member is not None:
+                return _format_discord_name(member)
+            try:
+                fetched_member = await guild.fetch_member(int(discord_id))
+            except Exception:
+                fetched_member = None
+            if fetched_member is not None:
+                return _format_discord_name(fetched_member)
+
+        user = self.bot.get_user(int(discord_id))
+        if user is not None:
+            return _format_discord_name(user)
+        try:
+            fetched_user = await self.bot.fetch_user(int(discord_id))
+        except Exception:
+            fetched_user = None
+        if fetched_user is not None:
+            return _format_discord_name(fetched_user)
+        return str(discord_id)
+
+    async def _fetch_guild_member(
+        self,
+        guild: discord.Guild,
+        discord_id: int,
+    ) -> GuildMemberLookupResult:
+        member = guild.get_member(int(discord_id))
+        if member is not None:
+            return GuildMemberLookupResult(member=member, confirmed_absent=False)
+        try:
+            fetched = await guild.fetch_member(int(discord_id))
+        except discord.NotFound:
+            return GuildMemberLookupResult(member=None, confirmed_absent=True)
+        except discord.HTTPException as exc:
+            return GuildMemberLookupResult(
+                member=None,
+                confirmed_absent=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception as exc:
+            return GuildMemberLookupResult(
+                member=None,
+                confirmed_absent=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return GuildMemberLookupResult(member=fetched, confirmed_absent=False)
+
+    async def _ban_guild_user(
+        self,
+        guild: discord.Guild,
+        discord_id: int,
+        *,
+        member: discord.abc.Snowflake | None = None,
+        reason: str,
+    ) -> str:
+        target = member or discord.Object(id=int(discord_id))
+        try:
+            await guild.ban(target, reason=reason, delete_message_seconds=0)
+            return "ban_success"
+        except discord.Forbidden:
+            log.warning("BetaInvite: Fehlende Rechte um %s zu bannen.", discord_id)
+            return "ban_forbidden"
+        except discord.HTTPException as exc:
+            log.warning("BetaInvite: HTTP-Fehler beim Bannen von %s: %s", discord_id, exc)
+            return f"ban_http_error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("BetaInvite: Unbekannter Fehler beim Bannen von %s: %s", discord_id, exc)
+            return f"ban_error: {exc}"
+
+    async def _log_admin_invite_event(
+        self,
+        event: str,
+        *,
+        record: BetaInviteRecord,
+        intent: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        discord_name: str | None = None,
+        error: Any = None,
+        task_result: Any = None,
+    ) -> None:
+        resolved_name = await self._resolve_discord_name(record.discord_id, fallback=discord_name)
+        message = "\n".join(
+            (
+                f"BetaInvite {event}",
+                f"discord_id: `{record.discord_id}`",
+                f"discord_name: `{self._serialize_admin_log_value(resolved_name, max_len=250)}`",
+                f"steam_id64: `{record.steam_id64}`",
+                f"intent: `{intent or '-'}`",
+                f"status: `{old_status or '-'} -> {new_status or '-'}`",
+                f"scheduled_invite_at: `{_format_timestamp_utc(record.scheduled_invite_at) or '-'}`",
+                f"dispatch_attempts: `{max(0, int(record.dispatch_attempts))}`",
+                f"error: `{self._serialize_admin_log_value(error, max_len=500)}`",
+                "steam_task_result:",
+                f"```json\n{self._serialize_admin_log_value(task_result, max_len=1200)}\n```",
+            )
+        )
+        await self._notify_log_channel(message)
 
     @staticmethod
     def _extract_discord_username(message: str) -> str | None:
@@ -2766,6 +3323,8 @@ class BetaInviteFlow(commands.Cog):
             )
             return
 
+        intent_record = _get_intent_record(interaction.user.id)
+
         if existing and existing.status == STATUS_INVITE_SENT and existing.steam_id64 == resolved:
             await self._followup_send(
                 interaction,
@@ -2777,6 +3336,25 @@ class BetaInviteFlow(commands.Cog):
                 "betainvite_already_invited",
                 discord_id=interaction.user.id,
                 steam_id64=resolved,
+            )
+            return
+
+        if (
+            existing
+            and existing.status in COMMUNITY_DELAY_ACTIVE_STATUSES
+            and existing.steam_id64 == resolved
+        ):
+            await self._followup_send(
+                interaction,
+                _build_community_delay_success_message(resolved),
+                ephemeral=True,
+            )
+            self._mark_ticket_completed(interaction.user.id)
+            _trace(
+                "betainvite_already_queued",
+                discord_id=interaction.user.id,
+                steam_id64=resolved,
+                scheduled_invite_at=existing.scheduled_invite_at,
             )
             return
 
@@ -2808,6 +3386,21 @@ class BetaInviteFlow(commands.Cog):
             return
 
         if record.status == STATUS_ERROR and record.friend_confirmed_at is not None:
+            if (
+                intent_record is not None
+                and intent_record.intent == INTENT_COMMUNITY
+                and record.dispatch_attempts > 0
+            ):
+                await self._followup_send(
+                    interaction,
+                    (
+                        "⚠️ Dein Invite wird gerade manuell geprüft.\n"
+                        f"Bitte melde dich nur bei Bedarf hier: {BETA_INVITE_SUPPORT_CONTACT}"
+                    ),
+                    ephemeral=True,
+                )
+                self._mark_ticket_completed(interaction.user.id)
+                return
             record = _update_invite(record.id, status=STATUS_WAITING, last_error=None) or record
             _trace(
                 "betainvite_error_retry_after_friend_confirmed",
@@ -2967,32 +3560,37 @@ class BetaInviteFlow(commands.Cog):
 
     def _record_successful_invite(
         self,
-        interaction: discord.Interaction,
         record: BetaInviteRecord,
         invited_at: int,
+        *,
+        guild_id: int | None = None,
+        discord_name: str | None = None,
     ) -> None:
         try:
             _log_invite_grant(
-                guild_id=int(interaction.guild.id) if interaction.guild else None,
-                discord_id=int(interaction.user.id),
-                discord_name=_format_discord_name(interaction.user),
+                guild_id=int(guild_id) if guild_id else None,
+                discord_id=int(record.discord_id),
+                discord_name=discord_name or str(record.discord_id),
                 steam_id64=record.steam_id64,
                 invited_at=int(invited_at),
             )
         except Exception:
             log.exception(
                 "BetaInvite: Protokollieren der Einladung für Nutzer %s fehlgeschlagen",
-                getattr(interaction.user, "id", "?"),
+                record.discord_id,
             )
 
     async def _send_invite_after_friend(
         self,
-        interaction: discord.Interaction,
+        interaction: discord.Interaction | None,
         record: BetaInviteRecord,
         *,
         account_id_hint: int | None = None,
+        bypass_community_delay: bool = False,
+        dispatch_source: str = "interactive",
+        discord_name_override: str | None = None,
     ) -> bool:
-        if isinstance(interaction, discord.Interaction):
+        if interaction is not None:
             self._trace_user_action(
                 interaction,
                 "send_invite_after_friend.start",
@@ -3005,21 +3603,84 @@ class BetaInviteFlow(commands.Cog):
             steam_id64=record.steam_id64,
             account_id_hint=account_id_hint,
             record_status=record.status,
+            dispatch_source=dispatch_source,
         )
         now_ts = int(time.time())
-        record = (
-            _update_invite(
-                record.id,
-                status=STATUS_WAITING,
-                friend_confirmed_at=now_ts,
-                last_error=None,
+        old_status = record.status
+        intent_record = _get_intent_record(record.discord_id)
+        intent = intent_record.intent if intent_record is not None else None
+        discord_name_for_audit = (
+            discord_name_override
+            or (
+                _format_discord_name(interaction.user)
+                if interaction is not None
+                else None
             )
-            or record
         )
 
-        account_id = (
-            account_id_hint or record.account_id or steam64_to_account_id(record.steam_id64)
-        )
+        if not bypass_community_delay and intent == INTENT_COMMUNITY:
+            queue_fields: dict[str, Any] = {
+                "status": STATUS_QUEUED_COMMUNITY_DELAY,
+                "scheduled_invite_at": now_ts + COMMUNITY_INVITE_DELAY_SECONDS,
+                "last_error": None,
+                "last_notified_at": now_ts,
+            }
+            if record.friend_confirmed_at is None:
+                queue_fields["friend_confirmed_at"] = now_ts
+            if account_id_hint is not None:
+                queue_fields["account_id"] = account_id_hint
+            record = _update_invite(record.id, **queue_fields) or record
+            await self._log_admin_invite_event(
+                "queue",
+                record=record,
+                intent=intent,
+                old_status=old_status,
+                new_status=record.status,
+                discord_name=discord_name_for_audit,
+                error=None,
+                task_result={"dispatch_source": dispatch_source},
+            )
+            _trace(
+                "invite_queued_community_delay",
+                discord_id=record.discord_id,
+                steam_id64=record.steam_id64,
+                scheduled_invite_at=record.scheduled_invite_at,
+            )
+            queue_message = _build_community_delay_success_message(record.steam_id64)
+            if interaction is not None:
+                if interaction.response.is_done():
+                    try:
+                        await self._edit_original_response(interaction, content=queue_message, view=None)
+                    except Exception:
+                        await self._followup_send(interaction, queue_message, ephemeral=True)
+                else:
+                    await self._response_send_message(interaction, queue_message, ephemeral=True)
+            self._mark_ticket_completed(record.discord_id)
+            return True
+
+        waiting_fields: dict[str, Any] = {
+            "last_error": None,
+        }
+        if dispatch_source != "community_dispatcher":
+            waiting_fields["status"] = STATUS_WAITING
+        if record.friend_confirmed_at is None:
+            waiting_fields["friend_confirmed_at"] = now_ts
+        if account_id_hint is not None:
+            waiting_fields["account_id"] = account_id_hint
+        if dispatch_source == "community_dispatcher":
+            waiting_fields["dispatch_attempts"] = record.dispatch_attempts + 1
+        record = _update_invite(record.id, **waiting_fields) or record
+        if dispatch_source == "community_dispatcher":
+            active_dispatch_record = _fetch_active_community_delay_claim(record.id)
+            if active_dispatch_record is None:
+                log.info(
+                    "BetaInvite: Dispatch-Claim vor Steam-Send verloren für discord_id=%s",
+                    record.discord_id,
+                )
+                return False
+            record = active_dispatch_record
+
+        account_id = account_id_hint or record.account_id or steam64_to_account_id(record.steam_id64)
 
         log.info(
             "Sending Steam invite: discord_id=%s, steam_id64=%s, account_id=%s",
@@ -3054,7 +3715,7 @@ class BetaInviteFlow(commands.Cog):
 
         stop_anim = asyncio.Event()
         anim_task = None
-        if isinstance(interaction, discord.Interaction):
+        if interaction is not None:
             base_msg = "⏳ Einladung wird über Steam verschickt"
             try:
                 if interaction.response.is_done():
@@ -3082,11 +3743,13 @@ class BetaInviteFlow(commands.Cog):
                 timeout=invite_task_timeout,
             )
 
-            # Stoppe Animation vor dem Senden des Endergebnisses
             stop_anim.set()
             await self._await_animation_task(anim_task)
 
-            if invite_outcome.timed_out and str(invite_outcome.status or "").upper() == "RUNNING":
+            if (
+                getattr(invite_outcome, "timed_out", False)
+                and str(getattr(invite_outcome, "status", "") or "").upper() == "RUNNING"
+            ):
                 log.warning(
                     "Steam invite task %s still running after initial timeout, extending wait by %.1fs",
                     getattr(invite_outcome, "task_id", "?"),
@@ -3103,49 +3766,77 @@ class BetaInviteFlow(commands.Cog):
             stop_anim.set()
             await self._await_animation_task(anim_task)
             log.exception("Steam invite task failed with exception")
-            _update_invite(
-                record.id,
-                status=STATUS_ERROR,
-                last_error=f"Interner Fehler: {exc}",
+            if dispatch_source == "community_dispatcher":
+                active_dispatch_record = _fetch_active_community_delay_claim(record.id)
+                if active_dispatch_record is None:
+                    log.info(
+                        "BetaInvite: Dispatch-Claim nach Exception nicht mehr aktiv für discord_id=%s",
+                        record.discord_id,
+                    )
+                    return False
+                record = active_dispatch_record
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_ERROR,
+                    last_error=f"Interner Fehler: {exc}",
+                )
+                or record
             )
-            await self._followup_send(
-                interaction,
-                "❌ Einladung fehlgeschlagen wegen eines internen Fehlers. Bitte versuche es später erneut.",
-                ephemeral=True,
-            )
+            if dispatch_source == "community_dispatcher":
+                await self._log_admin_invite_event(
+                    "dispatch_error",
+                    record=record,
+                    intent=intent,
+                    old_status=old_status,
+                    new_status=record.status,
+                    discord_name=discord_name_for_audit,
+                    error=record.last_error,
+                    task_result={"exception": str(exc)},
+                )
+            if interaction is not None:
+                await self._followup_send(
+                    interaction,
+                    "❌ Einladung fehlgeschlagen wegen eines internen Fehlers. Bitte versuche es später erneut.",
+                    ephemeral=True,
+                )
             return False
 
-        # Log das Ergebnis für bessere Diagnose
+        invite_timed_out = bool(getattr(invite_outcome, "timed_out", False))
+        invite_status = getattr(invite_outcome, "status", None)
+        invite_error = getattr(invite_outcome, "error", None)
+        invite_result = getattr(invite_outcome, "result", None)
+
         log.info(
             "Steam invite result: ok=%s, status=%s, timed_out=%s",
             invite_outcome.ok,
-            invite_outcome.status,
-            invite_outcome.timed_out,
+            invite_status,
+            invite_timed_out,
         )
         _trace(
             "invite_result",
             discord_id=record.discord_id,
             steam_id64=record.steam_id64,
             ok=invite_outcome.ok,
-            status=invite_outcome.status,
-            timed_out=invite_outcome.timed_out,
-            error=invite_outcome.error,
-            result=invite_outcome.result,
+            status=invite_status,
+            timed_out=invite_timed_out,
+            error=invite_error,
+            result=invite_result,
         )
 
         if not invite_outcome.ok:
-            error_text = invite_outcome.error or "Game Coordinator hat die Einladung abgelehnt."
-            is_timeout = invite_outcome.timed_out
+            error_text = invite_error or "Game Coordinator hat die Einladung abgelehnt."
+            is_timeout = invite_timed_out
 
             # Verbesserte Fehlerbehandlung für spezifische Steam GC Errors
-            if invite_outcome.result and isinstance(invite_outcome.result, dict):
-                result_error = invite_outcome.result.get("error")
+            if invite_result and isinstance(invite_result, dict):
+                result_error = invite_result.get("error")
                 if result_error:
                     candidate = str(result_error).strip()
                     if candidate:
                         error_text = candidate
 
-                data = invite_outcome.result.get("data")
+                data = invite_result.get("data")
                 if isinstance(data, dict):
                     response = data.get("response")
                     # GC-Response ist doppelt verschachtelt: data.response.response
@@ -3213,10 +3904,10 @@ class BetaInviteFlow(commands.Cog):
                 "discord_id": record.discord_id,
                 "steam_id64": record.steam_id64,
                 "account_id": account_id,
-                "task_status": invite_outcome.status,
-                "timed_out": invite_outcome.timed_out,
-                "task_error": invite_outcome.error,
-                "task_result": invite_outcome.result,
+                "task_status": invite_status,
+                "timed_out": invite_timed_out,
+                "task_error": invite_error,
+                "task_result": invite_result,
                 "record_id": record.id,
                 "error_text": error_text,
                 "already_has_game": already_has_game,
@@ -3226,34 +3917,83 @@ class BetaInviteFlow(commands.Cog):
             except TypeError:
                 serialized_details = str(details)
 
+            guild = self._main_guild()
+            guild_id = (
+                int(interaction.guild.id)
+                if interaction is not None and interaction.guild
+                else (int(guild.id) if guild else None)
+            )
+            if dispatch_source == "community_dispatcher":
+                active_dispatch_record = _fetch_active_community_delay_claim(record.id)
+                if active_dispatch_record is None:
+                    log.info(
+                        "BetaInvite: Dispatch-Claim vor Ergebnis-Write nicht mehr aktiv für discord_id=%s",
+                        record.discord_id,
+                    )
+                    return False
+                record = active_dispatch_record
+
             if already_has_game:
                 # Spiel ist schon vorhanden - als Erfolg werten
                 _failure_log.info("Invite not needed (already has game): %s", serialized_details)
-                _update_invite(
-                    record.id,
-                    status=STATUS_INVITE_SENT,
-                    invite_sent_at=now_ts,
-                    last_error=None,
+                success_fields: dict[str, Any] = {
+                    "status": STATUS_INVITE_SENT,
+                    "invite_sent_at": now_ts,
+                    "last_error": None,
+                }
+                if interaction is not None:
+                    success_fields["last_notified_at"] = now_ts
+                record = _update_invite(record.id, **success_fields) or record
+                self._record_successful_invite(
+                    record,
+                    now_ts,
+                    guild_id=guild_id,
+                    discord_name=discord_name_for_audit,
                 )
-                self._record_successful_invite(interaction, record, now_ts)
+                if dispatch_source == "community_dispatcher":
+                    await self._log_admin_invite_event(
+                        "dispatch_success",
+                        record=record,
+                        intent=intent,
+                        old_status=old_status,
+                        new_status=record.status,
+                        discord_name=discord_name_for_audit,
+                        error=None,
+                        task_result=details,
+                    )
                 msg = "✅ Dein Account besitzt bereits Deadlock-Zugang! Prüfe deine Steam-Bibliothek oder https://store.steampowered.com/account/playtestinvites ."
-                if isinstance(interaction, discord.Interaction) and interaction.response.is_done():
-                    try:
-                        await self._edit_original_response(interaction, content=msg, view=None)
-                    except Exception:
+                if interaction is not None:
+                    if interaction.response.is_done():
+                        try:
+                            await self._edit_original_response(interaction, content=msg, view=None)
+                        except Exception:
+                            await self._followup_send(interaction, msg, ephemeral=True)
+                    else:
                         await self._followup_send(interaction, msg, ephemeral=True)
-                else:
-                    await self._followup_send(interaction, msg, ephemeral=True)
                 await self._trigger_immediate_role_assignment(record.discord_id)
                 self._mark_ticket_completed(record.discord_id)
                 return True
 
             _failure_log.error("Invite task failed: %s", serialized_details)
-            _update_invite(
-                record.id,
-                status=STATUS_ERROR,
-                last_error=str(error_text),
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_ERROR,
+                    last_error=str(error_text),
+                )
+                or record
             )
+            if dispatch_source == "community_dispatcher":
+                await self._log_admin_invite_event(
+                    "dispatch_error",
+                    record=record,
+                    intent=intent,
+                    old_status=old_status,
+                    new_status=record.status,
+                    discord_name=discord_name_for_audit,
+                    error=error_text,
+                    task_result=details,
+                )
 
             is_retryable = (
                 not already_has_game
@@ -3265,13 +4005,14 @@ class BetaInviteFlow(commands.Cog):
             else:
                 err_msg += f"Falls du denkst, dass das ein Fehler ist, melde dich bitte bei hier {BETA_INVITE_SUPPORT_CONTACT}."
             retry_view = BetaInviteRetryView(self) if is_retryable else None
-            if isinstance(interaction, discord.Interaction) and interaction.response.is_done():
-                try:
-                    await self._edit_original_response(interaction, content=err_msg, view=retry_view)
-                except Exception:
+            if interaction is not None:
+                if interaction.response.is_done():
+                    try:
+                        await self._edit_original_response(interaction, content=err_msg, view=retry_view)
+                    except Exception:
+                        await self._followup_send(interaction, err_msg, ephemeral=True)
+                else:
                     await self._followup_send(interaction, err_msg, ephemeral=True)
-            else:
-                await self._followup_send(interaction, err_msg, ephemeral=True)
 
             _trace(
                 "invite_failed",
@@ -3279,21 +4020,50 @@ class BetaInviteFlow(commands.Cog):
                 steam_id64=record.steam_id64,
                 error_text=error_text,
                 timed_out=is_timeout,
-                task_status=invite_outcome.status,
+                task_status=invite_status,
             )
             return False
 
-        record = (
-            _update_invite(
-                record.id,
-                status=STATUS_INVITE_SENT,
-                invite_sent_at=now_ts,
-                last_notified_at=now_ts,
-                last_error=None,
-            )
-            or record
+        success_fields: dict[str, Any] = {
+            "status": STATUS_INVITE_SENT,
+            "invite_sent_at": now_ts,
+            "last_error": None,
+        }
+        if interaction is not None:
+            success_fields["last_notified_at"] = now_ts
+        if dispatch_source == "community_dispatcher":
+            active_dispatch_record = _fetch_active_community_delay_claim(record.id)
+            if active_dispatch_record is None:
+                log.info(
+                    "BetaInvite: Dispatch-Claim vor Success-Write nicht mehr aktiv für discord_id=%s",
+                    record.discord_id,
+                )
+                return False
+            record = active_dispatch_record
+        record = _update_invite(record.id, **success_fields) or record
+        guild = self._main_guild()
+        guild_id = (
+            int(interaction.guild.id)
+            if interaction is not None and interaction.guild
+            else (int(guild.id) if guild else None)
         )
-        self._record_successful_invite(interaction, record, now_ts)
+        self._record_successful_invite(
+            record,
+            now_ts,
+            guild_id=guild_id,
+            discord_name=discord_name_for_audit,
+        )
+        if dispatch_source == "community_dispatcher":
+            await self._log_admin_invite_event(
+                "dispatch_success",
+                record=record,
+                intent=intent,
+                old_status=old_status,
+                new_status=record.status,
+                discord_name=discord_name_for_audit,
+                error=None,
+                task_result=invite_result,
+            )
         _trace(
             "invite_sent",
             discord_id=record.discord_id,
@@ -3310,18 +4080,19 @@ class BetaInviteFlow(commands.Cog):
             "⚠️Verlässt du den Server wird der Invite ungültig, egal ob dein Invite noch aussteht oder du Deadlock schon hast."
         )
 
-        if isinstance(interaction, discord.Interaction) and interaction.response.is_done():
-            try:
-                await self._edit_original_response(interaction, content=message, view=None)
-            except Exception:
+        if interaction is not None:
+            if interaction.response.is_done():
+                try:
+                    await self._edit_original_response(interaction, content=message, view=None)
+                except Exception:
+                    await self._followup_send(interaction, message, ephemeral=True)
+            else:
                 await self._followup_send(interaction, message, ephemeral=True)
-        else:
-            await self._followup_send(interaction, message, ephemeral=True)
 
-        try:
-            await self._send_user_dm(interaction.user, message, interaction=interaction)
-        except Exception:  # pragma: no cover - DM optional
-            log.debug("Konnte Bestätigungs-DM nicht senden", exc_info=True)
+            try:
+                await self._send_user_dm(interaction.user, message, interaction=interaction)
+            except Exception:  # pragma: no cover - DM optional
+                log.debug("Konnte Bestätigungs-DM nicht senden", exc_info=True)
 
         self._mark_ticket_completed(record.discord_id)
         return True
@@ -3355,6 +4126,15 @@ class BetaInviteFlow(commands.Cog):
             await self._response_send_message(
                 interaction,
                 _build_already_invited_message(record, record.steam_id64),
+                ephemeral=True,
+            )
+            self._mark_ticket_completed(record.discord_id)
+            return
+
+        if record.status in COMMUNITY_DELAY_ACTIVE_STATUSES:
+            await self._response_send_message(
+                interaction,
+                _build_community_delay_success_message(record.steam_id64),
                 ephemeral=True,
             )
             self._mark_ticket_completed(record.discord_id)
@@ -3801,22 +4581,59 @@ class BetaInviteFlow(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
         try:
-            invited = _has_successful_invite(member.id)
+            record = _fetch_invite_by_discord(member.id)
+            intent_record = _get_intent_record(member.id)
         except Exception:
             log.exception("BetaInvite: Konnte Invite-Status für %s nicht prüfen", member.id)
             return
-        if not invited or not member.guild:
+        if record is None or not member.guild:
             return
-        try:
-            await member.guild.ban(member, reason=SERVER_LEAVE_BAN_REASON, delete_message_seconds=0)
+        intent = intent_record.intent if intent_record is not None else None
+        queued_community_leave = (
+            record.status in COMMUNITY_DELAY_ACTIVE_STATUSES and intent == INTENT_COMMUNITY
+        )
+        if record.status != STATUS_INVITE_SENT and not queued_community_leave:
+            return
+
+        if queued_community_leave:
+            old_status = record.status
+            record = (
+                _update_invite(
+                    record.id,
+                    status=STATUS_CANCELLED,
+                    last_error="Nutzer hat den Server vor dem geplanten Invite-Versand verlassen.",
+                )
+                or record
+            )
+            ban_result = await self._ban_guild_user(
+                member.guild,
+                member.id,
+                member=member,
+                reason=SERVER_LEAVE_BAN_REASON,
+            )
+            await self._log_admin_invite_event(
+                "cancel",
+                record=record,
+                intent=intent,
+                old_status=old_status,
+                new_status=record.status,
+                discord_name=_format_discord_name(member),
+                error=record.last_error,
+                task_result={"ban_result": ban_result},
+            )
+            return
+
+        ban_result = await self._ban_guild_user(
+            member.guild,
+            member.id,
+            member=member,
+            reason=SERVER_LEAVE_BAN_REASON,
+        )
+        if ban_result == "ban_success":
             log.info(
                 "BetaInvite: %s wurde wegen Server-Verlassen nach Invite gebannt.",
                 member.id,
             )
-        except discord.Forbidden:
-            log.warning("BetaInvite: Fehlende Rechte um %s zu bannen.", member.id)
-        except discord.HTTPException as exc:
-            log.warning("BetaInvite: HTTP-Fehler beim Bannen von %s: %s", member.id, exc)
 
 
 def _extract_kofi_token(payload: Mapping[str, Any], headers: Mapping[str, Any]) -> str:
