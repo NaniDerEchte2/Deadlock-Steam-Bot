@@ -496,6 +496,7 @@ const {
   markFriendRequestSentStmt, markFriendRequestSkippedStmt, markFriendRequestFailedStmt,
   deleteFriendRequestStmt, clearFriendFlagStmt,
   selectSteamLinkOwnersForSteamIdStmt, verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+  selectActiveVerifiedFriendLinkForUserStmt, upsertRoleCleanupPendingStmt,
 } = database;
 installSteamTaskCapTrigger();
 pruneSteamTasks('startup');
@@ -637,6 +638,7 @@ const sharedCtx = {
   markFriendRequestSentStmt, markFriendRequestSkippedStmt, markFriendRequestFailedStmt,
   deleteFriendRequestStmt, clearFriendFlagStmt,
   selectSteamLinkOwnersForSteamIdStmt, verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+  selectActiveVerifiedFriendLinkForUserStmt, upsertRoleCleanupPendingStmt,
 };
 
 const gcScheduler = createGcScheduler({

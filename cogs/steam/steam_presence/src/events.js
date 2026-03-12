@@ -219,8 +219,17 @@ client.on('friendRelationship', (steamId, relationship) => {
 
   if (Number(relationship) === Number(EFriendRelationship.None)) {
     log('info', 'Friendship ended, unverifying in steam_links', { steam_id64: sid64 || sid64Raw });
-    if (unverifySteamLink(sid64 || sid64Raw)) {
-      log('info', 'Unverified steam link', { steam_id64: sid64 || sid64Raw });
+    const unfollowResult = unverifySteamLink(sid64 || sid64Raw, {
+      source: 'friendRelationship_event',
+      reason: `Steam unfollow live event (friendRelationship=None, steam_id=${sid64 || sid64Raw || 'unknown'})`,
+    });
+    if (unfollowResult.changed || unfollowResult.queuedCleanup) {
+      log('info', 'Unverified steam link', {
+        steam_id64: sid64 || sid64Raw,
+        owner_user_id: unfollowResult.ownerUserId || undefined,
+        queued_role_cleanup: Boolean(unfollowResult.queuedCleanup),
+        active_friend_link_remains: Boolean(unfollowResult.activeFriendLinkRemains),
+      });
     }
   }
   });

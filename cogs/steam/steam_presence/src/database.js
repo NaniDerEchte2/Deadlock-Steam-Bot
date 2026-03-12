@@ -58,6 +58,7 @@ module.exports = (ctx) => {
       steam_id   TEXT    NOT NULL,
       name       TEXT,
       verified   INTEGER DEFAULT 0,
+      is_steam_friend INTEGER DEFAULT 0,
       primary_account INTEGER DEFAULT 0,
       deadlock_rank INTEGER,
       deadlock_rank_name TEXT,
@@ -70,6 +71,7 @@ module.exports = (ctx) => {
     )
   `).run();
   for (const alterSql of [
+    "ALTER TABLE steam_links ADD COLUMN is_steam_friend INTEGER DEFAULT 0",
     "ALTER TABLE steam_links ADD COLUMN deadlock_rank INTEGER",
     "ALTER TABLE steam_links ADD COLUMN deadlock_rank_name TEXT",
     "ALTER TABLE steam_links ADD COLUMN deadlock_subrank INTEGER",
@@ -166,6 +168,20 @@ module.exports = (ctx) => {
       friend INTEGER NOT NULL,
       checked_at INTEGER NOT NULL
     )
+  `).run();
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS steam_role_cleanup_pending(
+      user_id INTEGER PRIMARY KEY,
+      reason TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    )
+  `).run();
+  db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_steam_role_cleanup_pending_updated
+    ON steam_role_cleanup_pending(updated_at)
   `).run();
 
   // ---------- Standalone Dashboard Tables ----------
@@ -407,7 +423,7 @@ module.exports = (ctx) => {
   `);
 
   const steamLinksForSyncStmt = db.prepare(`
-    SELECT steam_id, user_id, name, verified
+    SELECT steam_id, user_id, name, verified, is_steam_friend
       FROM steam_links
      WHERE steam_id IS NOT NULL
        AND steam_id != ''
@@ -514,6 +530,23 @@ module.exports = (ctx) => {
     WHERE steam_id = @steam_id
       AND user_id = @user_id
   `);
+  const selectActiveVerifiedFriendLinkForUserStmt = db.prepare(`
+    SELECT 1
+      FROM steam_links
+     WHERE user_id = ?
+       AND verified = 1
+       AND is_steam_friend = 1
+     LIMIT 1
+  `);
+  const upsertRoleCleanupPendingStmt = db.prepare(`
+    INSERT INTO steam_role_cleanup_pending(
+      user_id, reason, attempts, last_error, created_at, updated_at
+    )
+    VALUES (?, ?, 0, NULL, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      reason = excluded.reason,
+      updated_at = excluded.updated_at
+  `);
 
   return {
     db,
@@ -557,5 +590,7 @@ module.exports = (ctx) => {
     selectSteamLinkOwnersForSteamIdStmt,
     verifySteamLinkForUserStmt,
     unverifySteamLinkForUserStmt,
+    selectActiveVerifiedFriendLinkForUserStmt,
+    upsertRoleCleanupPendingStmt,
   };
 };

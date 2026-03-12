@@ -166,6 +166,32 @@ def _user_has_verified_friend_link(conn, user_id: int) -> bool:
     return bool(row)
 
 
+def _enqueue_role_cleanup_pending(
+    conn,
+    user_id: int,
+    reason: str,
+    *,
+    now: int | None = None,
+) -> bool:
+    if _user_has_verified_friend_link(conn, user_id):
+        return False
+
+    now_ts = int(now if now is not None else time.time())
+    conn.execute(
+        """
+        INSERT INTO steam_role_cleanup_pending(
+          user_id, reason, attempts, last_error, created_at, updated_at
+        )
+        VALUES (?, ?, 0, NULL, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          reason = excluded.reason,
+          updated_at = excluded.updated_at
+        """,
+        (int(user_id), str(reason or "Steam unfollow cleanup"), now_ts, now_ts),
+    )
+    return True
+
+
 async def sync_all_friends(tasks: SteamTaskClient | None = None) -> dict:
     """
     Synchronize all current Steam bot friends to the database.
@@ -403,21 +429,8 @@ async def sync_all_friends(tasks: SteamTaskClient | None = None) -> dict:
                         action_triggered = True
                         cleared += changed
                         last_action_at = now
-                        if not _user_has_verified_friend_link(conn, user_id):
+                        if _enqueue_role_cleanup_pending(conn, user_id, reason, now=now):
                             fully_unfollowed_user_ids.append(user_id)
-                            conn.execute(
-                                """
-                                INSERT INTO steam_role_cleanup_pending(
-                                  user_id, reason, attempts, last_error, created_at, updated_at
-                                )
-                                VALUES (?, ?, 0, NULL, ?, ?)
-                                ON CONFLICT(user_id) DO UPDATE SET
-                                  reason = excluded.reason,
-                                  last_error = NULL,
-                                  updated_at = excluded.updated_at
-                                """,
-                                (user_id, reason, now, now),
-                            )
                         else:
                             log.debug(
                                 "Skipping role cleanup enqueue for user=%s because verified friend link(s) remain",

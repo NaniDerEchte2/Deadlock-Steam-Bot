@@ -17,6 +17,8 @@ const { URL } = require('url');
  *            deleteFriendRequestStmt, clearFriendFlagStmt,
  *            selectSteamLinkOwnersForSteamIdStmt,
  *            verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+ *            selectActiveVerifiedFriendLinkForUserStmt,
+ *            upsertRoleCleanupPendingStmt,
  *            countFriendRequestsSentSinceStmt }
  */
 module.exports = (ctx) => {
@@ -33,6 +35,7 @@ module.exports = (ctx) => {
     deleteFriendRequestStmt, clearFriendFlagStmt,
     selectSteamLinkOwnersForSteamIdStmt,
     verifySteamLinkForUserStmt, unverifySteamLinkForUserStmt,
+    selectActiveVerifiedFriendLinkForUserStmt, upsertRoleCleanupPendingStmt,
     countFriendRequestsSentSinceStmt,
   } = ctx;
 
@@ -89,6 +92,12 @@ module.exports = (ctx) => {
       if (Number(value) === Number(code)) return name;
     }
     return String(code);
+  }
+
+  function normalizeDiscordUserId(value) {
+    const userId = String(value || '').trim();
+    if (!/^\d+$/.test(userId) || userId === '0') return null;
+    return userId;
   }
 
   // ---------- HTTP util (local, for WebAPI) ----------
@@ -366,6 +375,14 @@ module.exports = (ctx) => {
       log('debug', 'Failed to clear steam_links flags after removal', { steam_id64: sid64, error: err && err.message ? err.message : String(err) });
     }
 
+    const owner = resolveUniqueOwnerUserId(sid64, 'remove_friendship_cleanup');
+    if (owner.ownerUserId) {
+      queueRoleCleanupIfFullyUnfollowed(
+        owner.ownerUserId,
+        `Steam friendship removed manually (steam_id=${sid64})`
+      );
+    }
+
     return {
       steam_id64: sid64,
       account_id: parsed.accountid ?? null,
@@ -436,23 +453,93 @@ module.exports = (ctx) => {
     }
   }
 
-  function unverifySteamLink(steamId64) {
+  function queueRoleCleanupIfFullyUnfollowed(userId, reason) {
+    const ownerUserId = normalizeDiscordUserId(userId);
+    if (!ownerUserId) {
+      return { queued: false, activeFriendLinkRemains: false, ownerUserId: null };
+    }
+    try {
+      if (selectActiveVerifiedFriendLinkForUserStmt.get(ownerUserId)) {
+        return {
+          queued: false,
+          activeFriendLinkRemains: true,
+          ownerUserId,
+        };
+      }
+      const now = nowSeconds();
+      upsertRoleCleanupPendingStmt.run(
+        ownerUserId,
+        String(reason || 'Steam unfollow cleanup'),
+        now,
+        now
+      );
+      return {
+        queued: true,
+        activeFriendLinkRemains: false,
+        ownerUserId,
+      };
+    } catch (err) {
+      log('warn', 'Failed to queue steam role cleanup', {
+        owner_user_id: ownerUserId,
+        reason,
+        error: err && err.message ? err.message : String(err),
+      });
+      return {
+        queued: false,
+        activeFriendLinkRemains: false,
+        ownerUserId,
+        error: err,
+      };
+    }
+  }
+
+  function unverifySteamLink(steamId64, options = {}) {
     const owner = resolveUniqueOwnerUserId(steamId64, 'unverify');
-    if (!owner.steamId || !owner.ownerUserId) return false;
+    if (!owner.steamId || !owner.ownerUserId) {
+      return {
+        changed: false,
+        queuedCleanup: false,
+        ownerUserId: owner.ownerUserId || null,
+        steamId: owner.steamId || null,
+      };
+    }
+
+    let changed = false;
     try {
       const info = unverifySteamLinkForUserStmt.run({
         steam_id: owner.steamId,
         user_id: owner.ownerUserId,
       });
-      return info.changes > 0;
+      changed = info.changes > 0;
     } catch (err) {
       log('warn', 'Failed to unverify steam link', {
         steam_id64: owner.steamId,
         owner_user_id: owner.ownerUserId,
         error: err && err.message ? err.message : String(err),
       });
-      return false;
+      return {
+        changed: false,
+        queuedCleanup: false,
+        ownerUserId: owner.ownerUserId,
+        steamId: owner.steamId,
+        error: err,
+      };
     }
+
+    const cleanupResult = queueRoleCleanupIfFullyUnfollowed(
+      owner.ownerUserId,
+      String(
+        options.reason ||
+        `Steam unfollow detected (source=${String(options.source || 'unknown')}, steam_id=${owner.steamId})`
+      )
+    );
+    return {
+      changed,
+      queuedCleanup: Boolean(cleanupResult.queued),
+      activeFriendLinkRemains: Boolean(cleanupResult.activeFriendLinkRemains),
+      ownerUserId: owner.ownerUserId,
+      steamId: owner.steamId,
+    };
   }
 
   const profileCardThrottle = new Map();
@@ -729,15 +816,19 @@ module.exports = (ctx) => {
       const dbRows = steamLinksForSyncStmt.all();
       const dbSteamIds = new Set();
       const missingNameIds = new Set();
+      const pendingCleanupByUser = new Map();
+      let unfollowReconciled = 0;
+      let cleanupQueued = 0;
+      let cleanupSkipped = 0;
 
       for (const row of dbRows) {
         const sid = normalizeSteamId64(row.steam_id);
         if (!sid || (ownSid && sid === ownSid)) continue;
         dbSteamIds.add(sid);
         if (Number(row.user_id) === 0) {
-          const nameRaw = typeof row.name === 'string' ? row.name : '';
-          if (!nameRaw || !String(nameRaw).trim()) missingNameIds.add(sid);
-        }
+        const nameRaw = typeof row.name === 'string' ? row.name : '';
+        if (!nameRaw || !String(nameRaw).trim()) missingNameIds.add(sid);
+      }
       }
 
       const idsNeedingName = new Set();
@@ -756,19 +847,63 @@ module.exports = (ctx) => {
         if (needsName && name) { verifySteamLink(sid, name); nameUpdates += 1; }
       }
 
+      for (const row of dbRows) {
+        const sid = normalizeSteamId64(row.steam_id);
+        if (!sid || (ownSid && sid === ownSid) || friendIds.has(sid)) continue;
+
+        const ownerUserId = normalizeDiscordUserId(row.user_id);
+        if (!ownerUserId) continue;
+
+        const verified = Number(row.verified) === 1;
+        const isSteamFriend = Number(row.is_steam_friend) === 1;
+        if (verified || isSteamFriend) {
+          const reconcileResult = unverifySteamLink(sid, {
+            source: `syncFriendsAndLinks:${reason}`,
+            reason: `Steam unfollow reconcile (${reason}, steam_id=${sid})`,
+          });
+          if (reconcileResult.changed) unfollowReconciled += 1;
+          if (reconcileResult.queuedCleanup) cleanupQueued += 1;
+          else if (reconcileResult.activeFriendLinkRemains) cleanupSkipped += 1;
+          continue;
+        }
+
+        if (!pendingCleanupByUser.has(ownerUserId)) {
+          pendingCleanupByUser.set(
+            ownerUserId,
+            `Steam cleanup reconcile (${reason}, steam_id=${sid})`
+          );
+        }
+      }
+
+      for (const [ownerUserId, cleanupReason] of pendingCleanupByUser.entries()) {
+        const queueResult = queueRoleCleanupIfFullyUnfollowed(ownerUserId, cleanupReason);
+        if (queueResult.queued) cleanupQueued += 1;
+        else if (queueResult.activeFriendLinkRemains) cleanupSkipped += 1;
+      }
+
       const requestOutcome = await processFriendRequestQueue(friendIds, reason);
 
-      if (nameUpdates || requestOutcome.sent || requestOutcome.failed) {
+      if (
+        nameUpdates ||
+        requestOutcome.sent ||
+        requestOutcome.failed ||
+        unfollowReconciled ||
+        cleanupQueued
+      ) {
         log('info', 'Friend/DB sync completed', {
           reason, name_updates: nameUpdates,
           friend_requests_sent: requestOutcome.sent,
           friend_requests_failed: requestOutcome.failed,
+          unfollow_reconciled: unfollowReconciled,
+          role_cleanup_queued: cleanupQueued,
+          role_cleanup_skipped_active_friend: cleanupSkipped,
           friends_known: friendIds.size, links_known: dbSteamIds.size,
           friend_sources: { client: clientCount, webapi: webCount },
         });
       } else {
         log('debug', 'Friend/DB sync done (no changes)', {
           reason, friends_known: friendIds.size, links_known: dbSteamIds.size,
+          role_cleanup_skipped_active_friend: cleanupSkipped,
           friend_sources: { client: clientCount, webapi: webCount },
         });
       }
