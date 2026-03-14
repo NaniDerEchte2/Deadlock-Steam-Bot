@@ -70,9 +70,11 @@ class _FakeBot:
         *,
         guilds: dict[int, Any] | None = None,
         users: dict[int, Any] | None = None,
+        cogs: dict[str, Any] | None = None,
     ) -> None:
         self._guilds = dict(guilds or {})
         self._users = dict(users or {})
+        self._cogs = dict(cogs or {})
 
     def add_view(self, *_: Any, **__: Any) -> None:
         return None
@@ -95,8 +97,35 @@ class _FakeBot:
     async def fetch_channel(self, _channel_id: int) -> Any | None:
         return None
 
-    def get_cog(self, _name: str) -> Any | None:
-        return None
+    def get_cog(self, name: str) -> Any | None:
+        return self._cogs.get(name)
+
+
+class _FakeSteamLinkCog:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def steam_start_url_for(self, uid: int) -> str:
+        self.calls += 1
+        return f"https://link.example.test/steam/login?launch=token-{uid}-{self.calls}"
+
+
+class _FakeUnsafeSteamLinkCog:
+    def steam_start_url_for(self, uid: int) -> str:
+        return f"https://link.example.test/steam/login?uid={uid}"
+
+
+class _FakeVerifiedCog:
+    def __init__(self, *, should_succeed: bool = True, exc: Exception | None = None) -> None:
+        self.should_succeed = should_succeed
+        self.exc = exc
+        self.calls: list[int] = []
+
+    async def assign_verified_role_with_retries(self, user_id: int) -> bool:
+        self.calls.append(int(user_id))
+        if self.exc is not None:
+            raise self.exc
+        return self.should_succeed
 
 
 class _FakeResponse:
@@ -261,6 +290,7 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     user_id INTEGER NOT NULL,
                     steam_id TEXT NOT NULL,
                     verified INTEGER DEFAULT 0,
+                    is_steam_friend INTEGER DEFAULT 0,
                     primary_account INTEGER DEFAULT 0,
                     updated_at INTEGER DEFAULT (strftime('%s','now'))
                 )
@@ -287,17 +317,17 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.mod._mark_payment_confirmed(discord_id, "Tester"))
         self.assertTrue(self.mod._consume_payment_for_invite(discord_id))
 
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_links(user_id, steam_id, verified, is_steam_friend, primary_account, updated_at)
+                VALUES(?, ?, 0, 0, 1, strftime('%s','now'))
+                """,
+                (discord_id, steam_id64),
+            )
+
         record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
         self.assertEqual(record.status, self.mod.STATUS_PENDING)
-
-        self.mod._queue_manual_friend_accept(steam_id64)
-        with self.mod.db.get_conn() as conn:
-            row = conn.execute(
-                "SELECT status FROM steam_friend_requests WHERE steam_id = ?",
-                (steam_id64,),
-            ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row["status"], "manual")
 
         waiting_record = self.mod._update_invite(
             record.id,
@@ -336,7 +366,6 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         flow._response_defer = _noop
         flow._await_animation_task = _noop
         flow._animate_processing = _noop
-        flow._sync_verified_on_friendship = _noop
         flow._mark_ticket_completed = lambda *_args, **_kwargs: None
 
         invite_send_calls: list[int] = []
@@ -350,6 +379,18 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         interaction = _FakeInteraction(_FakeUser(discord_id))
         await flow.handle_confirmation(interaction, waiting_record.id)
         self.assertEqual(len(invite_send_calls), 1, "Confirm-Step muss Invite-Send auslösen")
+        with self.mod.db.get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT verified, is_steam_friend
+                  FROM steam_links
+                 WHERE user_id = ? AND steam_id = ?
+                """,
+                (discord_id, steam_id64),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(int(row["verified"]), 1)
+        self.assertEqual(int(row["is_steam_friend"]), 1)
 
     async def test_community_flow_queues_after_confirmed_friendship(self) -> None:
         discord_id = 123_123_123
@@ -460,6 +501,72 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
             any("BetaInvite queue" in message for message in log_messages),
             "Queueing muss einen Admin-Logeintrag erzeugen",
         )
+
+    async def test_confirmed_friendship_sends_invite_even_if_verified_role_assignment_fails(self) -> None:
+        discord_id = 123_456_790
+        steam_id64 = "76561198000000041"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+        verified_cog = _FakeVerifiedCog(should_succeed=False)
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_links(user_id, steam_id, verified, is_steam_friend, primary_account, updated_at)
+                VALUES(?, ?, 0, 0, 1, strftime('%s','now'))
+                """,
+                (discord_id, steam_id64),
+            )
+
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        waiting_record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_WAITING,
+            friend_requested_at=1,
+            last_error=None,
+        )
+        assert waiting_record is not None
+
+        flow = self.mod.BetaInviteFlow(_FakeBot(cogs={"SteamVerifiedRole": verified_cog}))
+
+        async def _run_task(*_: Any, **__: Any) -> _FakeOutcome:
+            return _FakeOutcome(
+                ok=True,
+                result={
+                    "data": {
+                        "friend": True,
+                        "relationship_name": "Friend",
+                        "friend_source": "event",
+                        "account_id": account_id,
+                    }
+                },
+            )
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        invite_send_calls: list[int] = []
+
+        async def _send_invite_after_friend(*_args: Any, **_kwargs: Any) -> bool:
+            invite_send_calls.append(1)
+            return True
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+        flow._trace_user_action = lambda *_args, **_kwargs: None
+        flow._response_send_message = _noop
+        flow._response_edit_message = _noop
+        flow._edit_original_response = _noop
+        flow._followup_send = _noop
+        flow._response_defer = _noop
+        flow._await_animation_task = _noop
+        flow._animate_processing = _noop
+        flow._mark_ticket_completed = lambda *_args, **_kwargs: None
+        flow._send_invite_after_friend = _send_invite_after_friend
+
+        interaction = _FakeInteraction(_FakeUser(discord_id))
+        await flow.handle_confirmation(interaction, waiting_record.id)
+
+        self.assertEqual(invite_send_calls, [1])
+        self.assertEqual(verified_cog.calls, [discord_id])
 
     async def test_dispatcher_claims_due_community_invite_exclusively_across_instances(self) -> None:
         discord_id = 456_456_456
@@ -908,6 +1015,244 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verlassen", str(invite_row["last_error"]).lower())
         self.assertEqual(guild.ban_calls, [discord_id])
 
+    async def test_link_prompt_view_uses_fresh_signed_launch_urls(self) -> None:
+        discord_id = 777_000_111
+        user = _FakeUser(discord_id)
+        steam_cog = _FakeSteamLinkCog()
+        flow = self.mod.BetaInviteFlow(_FakeBot(cogs={"SteamLink": steam_cog}))
+
+        first_view = flow._build_link_prompt_view(
+            user,
+            next_handler=flow._continue_ticket_after_steam_link,
+        )
+        second_view = flow._build_link_prompt_view(
+            user,
+            next_handler=flow._continue_ticket_after_steam_link,
+        )
+
+        first_buttons = list(first_view.children)
+        second_buttons = list(second_view.children)
+        first_login_button = next(
+            button for button in first_buttons if getattr(button, "label", None) == "Direkt bei Steam anmelden"
+        )
+        second_login_button = next(
+            button for button in second_buttons if getattr(button, "label", None) == "Direkt bei Steam anmelden"
+        )
+        first_check_button = next(
+            button for button in first_buttons if getattr(button, "label", None) == "Steam-Link prüfen"
+        )
+
+        self.assertEqual(first_check_button.label, "Steam-Link prüfen")
+        self.assertIn("launch=", str(first_login_button.url))
+        self.assertNotIn("uid=", str(first_login_button.url))
+        self.assertIn("launch=", str(second_login_button.url))
+        self.assertNotEqual(first_login_button.url, second_login_button.url)
+
+    async def test_link_prompt_view_rejects_unsafe_uid_url(self) -> None:
+        user = _FakeUser(777_000_222)
+        flow = self.mod.BetaInviteFlow(
+            _FakeBot(cogs={"SteamLink": _FakeUnsafeSteamLinkCog()})
+        )
+
+        view = flow._build_link_prompt_view(
+            user,
+            next_handler=flow._continue_ticket_after_steam_link,
+        )
+        buttons = list(view.children)
+        login_button = next(
+            button for button in buttons if getattr(button, "label", None) == "Direkt bei Steam anmelden"
+        )
+        check_button = next(
+            button for button in buttons if getattr(button, "label", None) == "Steam-Link prüfen"
+        )
+
+        self.assertIsNone(login_button.url)
+        self.assertTrue(bool(login_button.disabled))
+        self.assertEqual(check_button.label, "Steam-Link prüfen")
+
+    def test_trace_steam_gate_state_emits_legacy_and_new_events(self) -> None:
+        captured: list[tuple[str, dict[str, Any]]] = []
+        original_trace = self.mod._trace
+
+        def _capture(event: str, **fields: Any) -> None:
+            captured.append((event, fields))
+
+        self.mod._trace = _capture
+        try:
+            self.mod._trace_steam_gate_state(777_000_999, "steam_link_missing", source="test")
+        finally:
+            self.mod._trace = original_trace
+
+        self.assertEqual(
+            [event for event, _fields in captured],
+            ["betainvite_no_link", "betainvite_steam_state"],
+        )
+        self.assertEqual(captured[0][1]["state"], "steam_link_missing")
+        self.assertEqual(captured[1][1]["state"], "steam_link_missing")
+
+    async def test_ticket_steam_link_check_without_link_rerenders_same_step_with_fresh_url(self) -> None:
+        discord_id = 777_000_333
+        ticket_channel_id = 4_243
+        steam_cog = _FakeSteamLinkCog()
+        flow = self.mod.BetaInviteFlow(_FakeBot(cogs={"SteamLink": steam_cog}))
+        flow._trace_user_action = lambda *_args, **_kwargs: None
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO beta_invite_tickets(discord_id, guild_id, channel_id, status)
+                VALUES(?, 1, ?, ?)
+                """,
+                (discord_id, ticket_channel_id, self.mod.BETA_TICKET_STATUS_OPEN),
+            )
+
+        captured: list[dict[str, Any]] = []
+
+        async def _capture_edit(_interaction: Any, *, content: str | None = None, view: Any | None = None) -> None:
+            captured.append({"content": content, "view": view})
+
+        async def _no_link(_discord_id: int) -> str | None:
+            return None
+
+        flow._edit_original_response = _capture_edit
+        flow._lookup_steam_link_with_retry = _no_link
+
+        interaction = _FakeInteraction(
+            _FakeUser(discord_id),
+            channel=_FakeChannel(ticket_channel_id),
+        )
+        await flow._continue_ticket_after_steam_link(interaction)
+        await flow._continue_ticket_after_steam_link(interaction)
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0]["content"], self.mod.BETA_INVITE_STEAM_LINK_MISSING_TEXT)
+        self.assertIsInstance(captured[0]["view"], self.mod.BetaInviteLinkPromptView)
+
+        first_url = next(
+            button.url
+            for button in captured[0]["view"].children
+            if getattr(button, "label", None) == "Direkt bei Steam anmelden"
+        )
+        second_url = next(
+            button.url
+            for button in captured[1]["view"].children
+            if getattr(button, "label", None) == "Direkt bei Steam anmelden"
+        )
+        self.assertIn("launch=", str(first_url))
+        self.assertIn("launch=", str(second_url))
+        self.assertNotEqual(first_url, second_url)
+
+    async def test_ticket_steam_link_check_with_link_moves_to_friendship_step(self) -> None:
+        discord_id = 777_000_444
+        ticket_channel_id = 4_244
+        steam_id64 = "76561198000000061"
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_links(user_id, steam_id, verified, is_steam_friend, primary_account, updated_at)
+                VALUES(?, ?, 0, 0, 1, strftime('%s','now'))
+                """,
+                (discord_id, steam_id64),
+            )
+            conn.execute(
+                """
+                INSERT INTO beta_invite_tickets(discord_id, guild_id, channel_id, status)
+                VALUES(?, 1, ?, ?)
+                """,
+                (discord_id, ticket_channel_id, self.mod.BETA_TICKET_STATUS_OPEN),
+            )
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+        flow._trace_user_action = lambda *_args, **_kwargs: None
+        captured: list[dict[str, Any]] = []
+
+        async def _capture_edit(_interaction: Any, *, content: str | None = None, view: Any | None = None) -> None:
+            captured.append({"content": content, "view": view})
+
+        async def _lookup(_discord_id: int) -> str | None:
+            return steam_id64
+
+        flow._edit_original_response = _capture_edit
+        flow._lookup_steam_link_with_retry = _lookup
+
+        interaction = _FakeInteraction(
+            _FakeUser(discord_id),
+            channel=_FakeChannel(ticket_channel_id),
+        )
+        await flow._continue_ticket_after_steam_link(interaction)
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsInstance(captured[0]["view"], self.mod.BetaInviteFriendHintView)
+        self.assertIn(self.mod.STEAM_BOT_FRIEND_CODE, str(captured[0]["content"]))
+        self.assertIn("Prüfe jetzt, ob die Steam-Freundschaft", str(captured[0]["content"]))
+        self.assertIn("Falls noch keine Freundschaft besteht", str(captured[0]["content"]))
+        self.assertIn("Der Bot verschickt selbst keine Anfrage", str(captured[0]["content"]))
+        self.assertIn("Freundschaft prüfen", str(captured[0]["content"]))
+        self.assertNotIn("Sende dem Steam-Bot jetzt", str(captured[0]["content"]))
+
+    async def test_confirm_friendship_pending_keeps_friendship_step(self) -> None:
+        discord_id = 777_000_555
+        steam_id64 = "76561198000000062"
+        account_id = self.mod.steam64_to_account_id(steam_id64)
+
+        with self.mod.db.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO steam_links(user_id, steam_id, verified, is_steam_friend, primary_account, updated_at)
+                VALUES(?, ?, 0, 0, 1, strftime('%s','now'))
+                """,
+                (discord_id, steam_id64),
+            )
+
+        record = self.mod._create_or_reset_invite(discord_id, steam_id64, account_id)
+        waiting_record = self.mod._update_invite(
+            record.id,
+            status=self.mod.STATUS_WAITING,
+            friend_requested_at=1,
+            last_error=None,
+        )
+        assert waiting_record is not None
+
+        flow = self.mod.BetaInviteFlow(_FakeBot())
+
+        async def _run_task(*_: Any, **__: Any) -> _FakeOutcome:
+            return _FakeOutcome(
+                ok=True,
+                status="DONE",
+                result={
+                    "data": {
+                        "friend": False,
+                        "relationship_name": "RequestRecipient",
+                        "friend_source": "manual",
+                        "account_id": account_id,
+                    }
+                },
+            )
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        captured: list[dict[str, Any]] = []
+
+        async def _capture_edit(_interaction: Any, *, content: str | None = None, view: Any | None = None) -> None:
+            captured.append({"content": content, "view": view})
+
+        flow.tasks = types.SimpleNamespace(run=_run_task)
+        flow._response_edit_message = _noop
+        flow._edit_original_response = _capture_edit
+        flow._followup_send = _noop
+        flow._await_animation_task = _noop
+        flow._animate_processing = _noop
+
+        interaction = _FakeInteraction(_FakeUser(discord_id))
+        await flow.handle_confirmation(interaction, waiting_record.id)
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsInstance(captured[0]["view"], self.mod.BetaInviteConfirmView)
+        self.assertIn("noch nicht bestätigt", str(captured[0]["content"]))
+        self.assertIn(self.mod.STEAM_BOT_FRIEND_CODE, str(captured[0]["content"]))
+
     async def test_ticket_manual_friend_flow_restores_persistent_ticket_step(self) -> None:
         discord_id = 987_654_321
         ticket_channel_id = 4_242
@@ -988,16 +1333,21 @@ class BetaInviteFlowIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT status, last_error FROM steam_beta_invites WHERE discord_id = ?",
                 (discord_id,),
             ).fetchone()
-            friend_row = conn.execute(
-                "SELECT status FROM steam_friend_requests WHERE steam_id = ?",
-                (steam_id64,),
+            friend_requests_table = conn.execute(
+                """
+                SELECT name
+                  FROM sqlite_master
+                 WHERE type = 'table' AND name = 'steam_friend_requests'
+                """
             ).fetchone()
 
         self.assertIsNotNone(invite_row)
         self.assertEqual(invite_row["status"], self.mod.STATUS_WAITING)
-        self.assertEqual(invite_row["last_error"], "Warte auf manuelle Steam-Freundschaft.")
-        self.assertIsNotNone(friend_row)
-        self.assertEqual(friend_row["status"], "manual")
+        self.assertEqual(invite_row["last_error"], "Warte auf bestätigte Steam-Freundschaft.")
+        self.assertIsNone(
+            friend_requests_table,
+            "Der Beta-Flow darf keine bot-seitige Friend-Request-Queue mehr anlegen",
+        )
 
     async def test_kofi_webhook_does_not_auto_match_username(self) -> None:
         discord_id = 555_111

@@ -83,16 +83,21 @@ EXPRESS_SUCCESS_DM = (
     "Vielen Dank für deinen Support! 💙 Deine Zahlung wurde erkannt. "
     "Bitte klicke jetzt im Ticket auf **Ich habe bezahlt – Weiter** und folge den Steam-Schritten."
 )
-STEAM_LINK_REQUIRED_DM = "Zahlung erhalten! Aber du musst erst deinen Steam-Account verknüpfen. Nutze danach /betainvite oder klicke im Panel auf Weiter."
+STEAM_LINK_REQUIRED_DM = (
+    "Zahlung erhalten! Aber du musst erst deinen Steam-Account verknüpfen. "
+    "Nutze danach /betainvite oder öffne dein Ticket und klicke auf **Steam-Link prüfen**."
+)
 
 BETA_INVITE_STEAM_LINK_STEP_TEXT = (
-    "Bevor wir fortfahren können, musst du deinen Steam-Account verknüpfen.\n"
-    "Nutze den Steam-Login unten. Sobald du fertig bist, klicke auf **Weiter**.\n"
+    "Schritt 1/2: Verknüpfe zuerst deinen Steam-Account.\n"
+    "Nutze den Steam-Login unten und klicke danach auf **Steam-Link prüfen**.\n"
+    "Danach folgt noch der Freundschafts-Schritt mit dem Bot-Freundescode.\n"
     f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden.\n"
 )
 BETA_INVITE_STEAM_LINK_MISSING_TEXT = (
-    "🚨 Es ist noch kein Steam-Account mit deinem Discord verknüpft.\n"
-    "Melde dich mit den unten verfügbaren Optionen bei Steam an. Sobald du fertig bist, klicke auf **Weiter**.\n"
+    "🚨 Schritt 1/2: Es ist noch kein Steam-Account mit deinem Discord verknüpft.\n"
+    "Melde dich mit den unten verfügbaren Optionen bei Steam an und klicke danach auf **Steam-Link prüfen**.\n"
+    "Danach folgt noch der Freundschafts-Schritt mit dem Bot-Freundescode.\n"
     f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
 )
 BETA_INVITE_INTENT_PROMPT_TEXT = (
@@ -223,11 +228,33 @@ def _preview_text(value: Any, *, max_len: int = 700) -> str | None:
     return f"{text[:max_len]}...(+{len(text) - max_len} chars)"
 
 
-def _manual_friend_request_workaround_text() -> str:
+def _trace_steam_gate_state(discord_id: int, state: str, **fields: Any) -> None:
+    payload = {
+        "discord_id": int(discord_id),
+        "state": str(state),
+    }
+    payload.update(fields)
+    # Keep the historic event name alive during the rollout so existing
+    # dashboards and alerts do not silently lose coverage.
+    _trace("betainvite_no_link", **payload)
+    _trace("betainvite_steam_state", **payload)
+
+
+def _manual_friend_request_workaround_text(*, pending: bool = False) -> str:
+    if pending:
+        return (
+            "ℹ️ Schritt 2/2: Die Steam-Freundschaft ist noch nicht bestätigt.\n"
+            "Sende dem Steam-Bot bitte manuell eine Freundschaftsanfrage "
+            f"(Freundescode `{STEAM_BOT_FRIEND_CODE}`) oder warte kurz, falls du sie gerade verschickt hast.\n"
+            "Der Bot verschickt selbst keine Anfrage. Klicke danach erneut auf **Freundschaft prüfen**.\n"
+            f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
+        )
+
     return (
-        "🔗 Nächster Schritt: Sende dem Steam-Bot bitte manuell eine Freundschaftsanfrage "
+        "🤝 Schritt 2/2: Prüfe jetzt, ob die Steam-Freundschaft mit dem Bot bereits besteht.\n"
+        "Falls noch keine Freundschaft besteht, sende dem Steam-Bot manuell eine Freundschaftsanfrage "
         f"(Freundescode `{STEAM_BOT_FRIEND_CODE}`).\n"
-        'Sobald die Freundschaft steht, klicke unten auf "Freundschaft bestätigt", dann geht dein Invite direkt weiter.\n'
+        "Der Bot verschickt selbst keine Anfrage. Klicke danach auf **Freundschaft prüfen**.\n"
         f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
     )
 
@@ -1570,40 +1597,6 @@ def _update_invite(record_id: int, **fields) -> BetaInviteRecord | None:
             (int(record_id),),
         ).fetchone()
     return _row_to_record(row)
-
-
-def _queue_manual_friend_accept(steam_id64: str) -> None:
-    sid = str(steam_id64 or "").strip()
-    if not sid:
-        return
-    with db.get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS steam_friend_requests(
-              steam_id TEXT PRIMARY KEY,
-              status TEXT DEFAULT 'pending',
-              requested_at INTEGER DEFAULT (strftime('%s','now')),
-              last_attempt INTEGER,
-              attempts INTEGER DEFAULT 0,
-              error TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO steam_friend_requests(steam_id, status, requested_at, last_attempt, attempts, error)
-            VALUES(?, 'manual', strftime('%s','now'), NULL, 0, NULL)
-            ON CONFLICT(steam_id) DO UPDATE SET
-              status='manual',
-              requested_at=strftime('%s','now'),
-              last_attempt=NULL,
-              attempts=0,
-              error=NULL
-            """,
-            (sid,),
-        )
-
-
 def steam64_to_account_id(steam_id64: str) -> int:
     """
     Konvertiert Steam ID64 zu Account ID für Steam API Calls.
@@ -1751,9 +1744,9 @@ class BetaInviteLinkPromptView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Ich habe mich verknüpft – Weiter",
-        style=discord.ButtonStyle.success,
-        emoji="➡️",
+        label="Steam-Link prüfen",
+        style=discord.ButtonStyle.primary,
+        emoji="🔎",
         custom_id=BETA_INVITE_STEAM_LINK_CONTINUE_CUSTOM_ID,
         row=1,
     )
@@ -1772,7 +1765,7 @@ class BetaInviteLinkPromptView(discord.ui.View):
         try:
             await self.cog._response_edit_message(
                 interaction,
-                content="⏳ Status wird geprüft... Bitte warten.",
+                content="⏳ Steam-Link wird geprüft... Bitte warten.",
                 view=None,
             )
         except Exception as exc:
@@ -1795,9 +1788,9 @@ class BetaInviteFriendHintView(discord.ui.View):
         self.user_id = user_id
 
     @discord.ui.button(
-        label="Freundschaft bestätigt",
-        style=discord.ButtonStyle.success,
-        emoji="🤝",
+        label="Freundschaft prüfen",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔍",
         custom_id=BETA_INVITE_FRIEND_HINT_CONTINUE_CUSTOM_ID,
     )
     async def confirm_friendship(
@@ -1816,7 +1809,7 @@ class BetaInviteFriendHintView(discord.ui.View):
         try:
             await self.cog._response_edit_message(
                 interaction,
-                content="⏳ Status wird geprüft... Bitte warten.",
+                content="⏳ Freundschaft wird geprüft... Bitte warten.",
                 view=None,
             )
         except Exception as exc:
@@ -1839,7 +1832,9 @@ class BetaInviteConfirmView(discord.ui.View):
         self.steam_id64 = steam_id64
 
     @discord.ui.button(
-        label="Freundschaft bestätigt", style=discord.ButtonStyle.success, emoji="🤝"
+        label="Freundschaft prüfen",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔍",
     )
     async def confirm_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.cog._trace_user_action(
@@ -2210,32 +2205,17 @@ class BetaInviteFlow(commands.Cog):
         interaction: discord.Interaction,
         steam_id64: str,
     ) -> bool:
-        try:
-            _queue_manual_friend_accept(steam_id64)
-        except Exception:
-            log.exception(
-                "Konnte manuelle Steam-Freundschaftsfreigabe nicht eintragen (steam_id=%s)",
-                steam_id64,
-            )
-            retry_view = self._build_link_prompt_view(
-                interaction.user,
-                next_handler=self._continue_ticket_after_steam_link,
-            )
-            await self._edit_original_response(
-                interaction,
-                content=(
-                    "❌ Wir konnten deine Freundschaft intern gerade nicht vormerken.\n"
-                    "Bitte klicke in ein paar Sekunden erneut auf **Weiter**.\n"
-                    f"Falls es weiterhin fehlschlägt: {BETA_INVITE_SUPPORT_CONTACT}"
-                ),
-                view=retry_view,
-            )
-            return False
         view = BetaInviteFriendHintView(self, interaction.user.id)
         await self._edit_original_response(
             interaction,
             content=_manual_friend_request_workaround_text(),
             view=view,
+        )
+        _trace_steam_gate_state(
+            interaction.user.id,
+            "steam_link_present_friendship_pending",
+            steam_id64=steam_id64,
+            source="ticket_step_transition",
         )
         return True
 
@@ -2252,7 +2232,7 @@ class BetaInviteFlow(commands.Cog):
                 content=BETA_INVITE_STEAM_LINK_MISSING_TEXT,
                 view=view,
             )
-            _trace("betainvite_no_link", discord_id=interaction.user.id)
+            _trace_steam_gate_state(interaction.user.id, "steam_link_missing")
             return
 
         queued_ok = await self._send_ticket_friend_hint_step(interaction, steam_id)
@@ -2359,11 +2339,31 @@ class BetaInviteFlow(commands.Cog):
                 BETA_TICKET_STATUS_OPEN,
                 closed_at=None,
             )
-            await self._send_ticket_intent_gate_step(
-                ticket_channel,
-                interaction.user,
-                interaction=interaction,
-            )
+            intent_record = _get_intent_record(interaction.user.id)
+            if intent_record is not None and intent_record.locked:
+                if intent_record.intent == INTENT_INVITE_ONLY:
+                    payment_token = _register_pending_payment(
+                        interaction.user.id, interaction.user.name
+                    )
+                    view = InviteOnlyPaymentView(self, interaction.user.id, KOFI_PAYMENT_URL)
+                    await self._send_channel_message(
+                        ticket_channel,
+                        content=_make_payment_message(payment_token),
+                        view=view,
+                        interaction=interaction,
+                    )
+                else:
+                    await self._send_ticket_steam_link_step(
+                        ticket_channel,
+                        interaction.user,
+                        interaction=interaction,
+                    )
+            else:
+                await self._send_ticket_intent_gate_step(
+                    ticket_channel,
+                    interaction.user,
+                    interaction=interaction,
+                )
 
         ack_text = ticket_channel.mention
         if interaction.response.is_done():
@@ -3262,6 +3262,12 @@ class BetaInviteFlow(commands.Cog):
             try:
                 candidate = steam_cog.steam_start_url_for(int(user.id))  # type: ignore[attr-defined]
                 steam_url = str(candidate) or None
+                if steam_url and "uid=" in steam_url and "launch=" not in steam_url:
+                    log.warning(
+                        "Verwerfe unsicheren BetaInvite-Steam-Link ohne Launch-Token für discord_id=%s",
+                        user.id,
+                    )
+                    steam_url = None
             except Exception:
                 log.debug("Konnte Steam-Link für BetaInvite nicht bauen", exc_info=True)
 
@@ -3288,22 +3294,26 @@ class BetaInviteFlow(commands.Cog):
             return
 
         if not resolved:
-            view = self._build_link_prompt_view(interaction.user)
-            prompt = (
-                "🚨 Es ist noch kein Steam-Account mit deinem Discord verknüpft.\n"
-                "Melde dich mit den unten verfügbaren Optionen bei Steam an. Sobald du fertig bist, klicke auf **Weiter**."
+            is_ticket_interaction = self._is_beta_ticket_interaction(interaction)
+            view = self._build_link_prompt_view(
+                interaction.user,
+                next_handler=self._continue_ticket_after_steam_link if is_ticket_interaction else None,
             )
-            _trace(
-                "betainvite_no_link",
-                discord_id=interaction.user.id,
-            )
+            _trace_steam_gate_state(interaction.user.id, "steam_link_missing")
 
-            await self._followup_send(
-                interaction,
-                prompt,
-                view=view,
-                ephemeral=True,
-            )
+            if is_ticket_interaction:
+                await self._edit_original_response(
+                    interaction,
+                    content=BETA_INVITE_STEAM_LINK_MISSING_TEXT,
+                    view=view,
+                )
+            else:
+                await self._followup_send(
+                    interaction,
+                    BETA_INVITE_STEAM_LINK_MISSING_TEXT,
+                    view=view,
+                    ephemeral=True,
+                )
             return
 
         try:
@@ -3459,7 +3469,6 @@ class BetaInviteFlow(commands.Cog):
             )
 
         if friend_ok:
-            # Bereits Freunde → sofort verified=1 + Rolle
             await self._sync_verified_on_friendship(interaction.user.id, resolved)
 
             await self._send_invite_after_friend(
@@ -3476,58 +3485,23 @@ class BetaInviteFlow(commands.Cog):
             return
 
         now_ts = int(time.time())
-        try:
-            _queue_manual_friend_accept(resolved)
-        except Exception:
-            log.exception(
-                "Konnte manuelle Steam-Freundschaftsfreigabe nicht eintragen (steam_id=%s)",
-                resolved,
-            )
-            _trace(
-                "friend_request_manual_queue_failed",
-                discord_id=interaction.user.id,
-                steam_id64=resolved,
-            )
-            record = (
-                _update_invite(
-                    record.id,
-                    status=STATUS_ERROR,
-                    account_id=account_id,
-                    last_error="Interner Queue-Fehler bei manueller Steam-Freundschaft.",
-                )
-                or record
-            )
-            retry_view = self._build_link_prompt_view(
-                interaction.user,
-                next_handler=self._continue_ticket_after_steam_link,
-            )
-            await self._followup_send(
-                interaction,
-                (
-                    "❌ Wir konnten deine Freundschaft intern gerade nicht vormerken.\n"
-                    "Bitte klicke auf **Weiter**, damit wir den Schritt erneut versuchen.\n"
-                    f"Falls der Fehler bleibt: {BETA_INVITE_SUPPORT_CONTACT}"
-                ),
-                view=retry_view,
-                ephemeral=True,
-            )
-            return
         record = (
             _update_invite(
                 record.id,
                 status=STATUS_WAITING,
                 account_id=account_id,
                 friend_requested_at=now_ts,
-                last_error="Warte auf manuelle Steam-Freundschaft.",
+                last_error="Warte auf bestätigte Steam-Freundschaft.",
             )
             or record
         )
-        _trace(
-            "friend_request_manual_required",
-            discord_id=interaction.user.id,
+        _trace_steam_gate_state(
+            interaction.user.id,
+            "steam_link_present_friendship_pending",
             steam_id64=resolved,
             account_id=account_id,
             record_id=record.id,
+            source="friendship_check_pending",
         )
         manual_message = _manual_friend_request_workaround_text()
         if self._is_beta_ticket_interaction(interaction):
@@ -4227,6 +4201,14 @@ class BetaInviteFlow(commands.Cog):
             if not friend_ok:
                 stop_anim.set()
                 await self._await_animation_task(anim_task)
+                _trace_steam_gate_state(
+                    record.discord_id,
+                    "steam_link_present_friendship_pending",
+                    steam_id64=record.steam_id64,
+                    account_id=record.account_id,
+                    record_id=record.id,
+                    source="confirm_button_pending",
+                )
                 retry_view = BetaInviteConfirmView(
                     self,
                     record.id,
@@ -4235,17 +4217,11 @@ class BetaInviteFlow(commands.Cog):
                 )
                 await self._edit_original_response(
                     interaction,
-                    content=(
-                        "ℹ️ Wir sind noch keine bestätigten Steam-Freunde. "
-                        "Bitte nimm die Freundschaftsanfrage an und klicke danach "
-                        "unten erneut auf **Freundschaft bestätigt**.\n"
-                        f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
-                    ),
+                    content=_manual_friend_request_workaround_text(pending=True),
                     view=retry_view,
                 )
                 return
 
-            # Freundschaft bestätigt → sofort verified=1 + Rolle
             await self._sync_verified_on_friendship(record.discord_id, record.steam_id64)
 
             await self._send_invite_after_friend(
@@ -4317,6 +4293,11 @@ class BetaInviteFlow(commands.Cog):
 
         await self._trigger_immediate_role_assignment(discord_id)
         _trace("friend_sync_verified", discord_id=discord_id, steam_id64=steam_id64)
+        _trace_steam_gate_state(
+            discord_id,
+            "friendship_confirmed",
+            steam_id64=steam_id64,
+        )
 
     async def _trigger_immediate_role_assignment(self, user_id: int) -> None:
         """Versucht, dem Nutzer sofort die Steam-Verified Rolle zu geben."""
@@ -4331,13 +4312,29 @@ class BetaInviteFlow(commands.Cog):
                         "Sofort-Rollen-Zuweisung fehlgeschlagen für User %s (assign returned False)",
                         user_id,
                     )
+                    _trace(
+                        "betainvite_verified_role_assignment_deferred",
+                        discord_id=user_id,
+                        reason="assign_returned_false",
+                    )
             else:
                 log.warning(
                     "SteamVerifiedRole Cog nicht gefunden - Sofort-Zuweisung nicht möglich für User %s",
                     user_id,
                 )
-        except Exception:
+                _trace(
+                    "betainvite_verified_role_assignment_deferred",
+                    discord_id=user_id,
+                    reason="missing_cog",
+                )
+        except Exception as exc:
             log.exception("Konnte Sofort-Rollen-Zuweisung nicht triggern für User %s", user_id)
+            _trace(
+                "betainvite_verified_role_assignment_deferred",
+                discord_id=user_id,
+                reason="exception",
+                error=str(exc),
+            )
 
     async def _start_betainvite_flow(self, interaction: discord.Interaction) -> None:
         self._trace_user_action(interaction, "betainvite_flow.start")
@@ -4391,12 +4388,12 @@ class BetaInviteFlow(commands.Cog):
                 await self._await_animation_task(anim_task)
 
                 view = self._build_link_prompt_view(interaction.user)
-                prompt = (
-                    "Bevor wir fortfahren können, musst du deinen Steam-Account verknüpfen.\n"
-                    "Nutze den Steam-Login unten. Sobald du fertig bist, klicke auf **Weiter**.\n"
+                await self._edit_original_response(
+                    interaction,
+                    content=BETA_INVITE_STEAM_LINK_MISSING_TEXT,
+                    view=view,
                 )
-                await self._edit_original_response(interaction, content=prompt, view=view)
-                _trace("betainvite_no_link", discord_id=interaction.user.id)
+                _trace_steam_gate_state(interaction.user.id, "steam_link_missing")
                 return
 
             # Nur eine vorhandene Steam-Verknüpfung reicht nicht aus:

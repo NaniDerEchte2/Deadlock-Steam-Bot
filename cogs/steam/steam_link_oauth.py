@@ -49,7 +49,11 @@ CLIENT_SECRET = (settings.discord_oauth_client_secret or "").strip()
 # State TTL
 STATE_TTL_SEC = 600  # 10 min
 STATE_MAX_ENTRIES = 4096
-STEAM_LOGIN_LAUNCH_TTL_SEC = 180
+_steam_launch_ttl_raw = getattr(settings, "steam_login_launch_ttl_sec", 900)
+try:
+    STEAM_LOGIN_LAUNCH_TTL_SEC = max(30, int(_steam_launch_ttl_raw or 900))
+except (TypeError, ValueError):
+    STEAM_LOGIN_LAUNCH_TTL_SEC = 900
 FRIEND_CODE_SUBMIT_COOLDOWN_SEC = 12
 FRIEND_CODE_DEDUPE_WINDOW_SEC = 120
 FRIEND_CODE_TRACK_TTL_SEC = 900

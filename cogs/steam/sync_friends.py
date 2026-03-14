@@ -118,7 +118,7 @@ def _save_steam_friend_to_db(steam_id64: str, discord_id: int | None = None) -> 
                 """,
                 (steam_id64,),
             )
-            log.info(
+            log.debug(
                 "Updated existing steam_link(s): steam=%s",
                 steam_id64,
             )
