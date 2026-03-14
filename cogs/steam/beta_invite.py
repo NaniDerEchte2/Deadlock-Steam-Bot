@@ -101,7 +101,7 @@ BETA_INVITE_STEAM_LINK_MISSING_TEXT = (
     f"Bei Problemen: bitte {BETA_INVITE_SUPPORT_CONTACT} hier melden."
 )
 BETA_INVITE_INTENT_PROMPT_TEXT = (
-    "Können wir dich künftig in der Community willkommen heißen oder möchtest du dir nur einen Invite sichern?"
+    "Möchtest du Teil der Community werden oder dir deinen Invite sichern?"
 )
 COMMUNITY_DELAY_SUCCESS_TEXT = (
     "✅ Alles erledigt.\n"
@@ -1654,8 +1654,9 @@ class BetaIntentGateView(discord.ui.View):
         return allowed
 
     @discord.ui.button(
-        label="Ich will Teil der Community werden",
-        style=discord.ButtonStyle.primary,
+        label="Ich bin dabei!",
+        style=discord.ButtonStyle.success,
+        emoji="🎮",
         custom_id=BETA_INVITE_INTENT_COMMUNITY_CUSTOM_ID,
     )
     async def choose_join(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1663,8 +1664,9 @@ class BetaIntentGateView(discord.ui.View):
         await self.cog.handle_intent_selection(interaction, INTENT_COMMUNITY)
 
     @discord.ui.button(
-        label="Nur den Invite mitnehmen",
-        style=discord.ButtonStyle.primary,
+        label="Schnellzugang",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚡",
         custom_id=BETA_INVITE_INTENT_INVITE_ONLY_CUSTOM_ID,
     )
     async def choose_invite_only(
@@ -2184,6 +2186,14 @@ class BetaInviteFlow(commands.Cog):
             interaction=interaction,
         )
 
+    @staticmethod
+    def _build_intent_gate_embed() -> discord.Embed:
+        return discord.Embed(
+            title="👋 Kurze Frage bevor es losgeht",
+            description=BETA_INVITE_INTENT_PROMPT_TEXT,
+            color=discord.Color.blurple(),
+        )
+
     async def _send_ticket_intent_gate_step(
         self,
         channel: discord.TextChannel,
@@ -2195,7 +2205,7 @@ class BetaInviteFlow(commands.Cog):
         _trace("betainvite_intent_prompt", discord_id=int(user.id))
         await self._send_channel_message(
             channel,
-            content=BETA_INVITE_INTENT_PROMPT_TEXT,
+            embed=self._build_intent_gate_embed(),
             view=view,
             interaction=interaction,
         )
@@ -2430,8 +2440,9 @@ class BetaInviteFlow(commands.Cog):
     async def _followup_send(
         self,
         interaction: discord.Interaction,
-        content: str,
+        content: str | None = None,
         *,
+        embed: discord.Embed | None = None,
         ephemeral: bool = False,
         view: Any | None = None,
     ) -> Any:
@@ -2439,10 +2450,15 @@ class BetaInviteFlow(commands.Cog):
         send_kwargs: dict[str, Any] = {"ephemeral": effective_ephemeral}
         if view is not None:
             send_kwargs["view"] = view
+        if embed is not None:
+            send_kwargs["embed"] = embed
+        content_preview = content
+        if content_preview is None and embed is not None:
+            content_preview = f"[embed] title={getattr(embed, 'title', None)!r}"
         return await self._run_ui_delivery(
             interaction=interaction,
             call="interaction.followup.send",
-            content=content,
+            content=content_preview,
             ephemeral=effective_ephemeral,
             view=view,
             op=lambda: interaction.followup.send(content, **send_kwargs),
@@ -3159,7 +3175,7 @@ class BetaInviteFlow(commands.Cog):
         _trace("betainvite_intent_prompt", discord_id=interaction.user.id)
         await self._followup_send(
             interaction,
-            BETA_INVITE_INTENT_PROMPT_TEXT,
+            embed=self._build_intent_gate_embed(),
             view=view,
             ephemeral=True,
         )
